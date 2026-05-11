@@ -1,4 +1,4 @@
-name: 02 - Download Google Drive Folder
+name: 02 -Download Google Drive Folder
 
 on:
   workflow_dispatch:
@@ -17,6 +17,8 @@ jobs:
   download:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
