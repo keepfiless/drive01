@@ -63,8 +63,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 zip curl bc python3-pip
-          # Install gdown for Google Drive downloads
-          pip3 install gdown --upgrade
+          # Install latest gdown for Google Drive downloads
+          pip3 install --upgrade gdown
+          # Verify gdown version
+          gdown --version || echo "gdown installed"
           echo "Tools installed successfully"
 
       - name: AVASAM Downloader - https://avasam.ir
@@ -136,20 +138,288 @@ jobs:
           echo "Starting Google Drive folder download..."
           echo "=========================================="
 
-          # Use gdown to download the entire folder recursively
+          # Create comprehensive Python script for recursive folder download
+          cat > /tmp/gdrive_download.py << 'PYTHON_SCRIPT'
+import os
+import sys
+import re
+import time
+import subprocess
+from pathlib import Path
+from urllib.parse import unquote
+
+def download_file_with_curl(file_id, output_path):
+    """Download file using curl with proper handling for large files"""
+    try:
+        # Create cookies file
+        cookies_file = '/tmp/gdrive_cookies.txt'
+        temp_file = '/tmp/gdrive_temp_response'
+
+        # First request to get cookies and check for confirmation
+        download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
+
+        curl_cmd = [
+            'curl', '-L', '-s', '-c', cookies_file, '-b', cookies_file,
+            '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            download_url,
+            '-o', temp_file
+        ]
+        subprocess.run(curl_cmd, timeout=120, check=False)
+
+        # Check response
+        if not os.path.exists(temp_file):
+            return False
+
+        with open(temp_file, 'rb') as f:
+            content = f.read(5000)
+            content_str = content.decode('utf-8', errors='ignore')
+
+        # Check if it's a confirmation page (for large files)
+        confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', content_str)
+        uuid_match = re.search(r'name="uuid" value="([^"]+)"', content_str)
+
+        if confirm_match or 'download anyway' in content_str.lower() or 'virus scan' in content_str.lower():
+            # Need to confirm download
+            confirm_token = confirm_match.group(1) if confirm_match else 't'
+
+            if uuid_match:
+                download_url = f'https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}&uuid={uuid_match.group(1)}'
+            else:
+                download_url = f'https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}'
+
+            curl_cmd = [
+                'curl', '-L', '-#',
+                '-c', cookies_file, '-b', cookies_file,
+                '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                download_url,
+                '-o', output_path
+            ]
+            result = subprocess.run(curl_cmd, timeout=3600, check=False)
+        elif b'<!DOCTYPE html>' not in content[:500] and b'<html' not in content[:500]:
+            # Already got the file
+            os.rename(temp_file, output_path)
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        else:
+            # Try direct download anyway
+            curl_cmd = [
+                'curl', '-L', '-#',
+                '-c', cookies_file, '-b', cookies_file,
+                '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                f'https://drive.google.com/uc?export=download&id={file_id}&confirm=t',
+                '-o', output_path
+            ]
+            subprocess.run(curl_cmd, timeout=3600, check=False)
+
+        # Cleanup temp file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+        # Verify download succeeded
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            # Make sure it's not an error page
+            with open(output_path, 'rb') as f:
+                start = f.read(200)
+            if b'<!DOCTYPE html>' in start and b'Error' in start:
+                os.remove(output_path)
+                return False
+            return True
+        return False
+
+    except Exception as e:
+        print(f"    curl error: {e}")
+        return False
+
+def download_with_gdown(file_id, output_path):
+    """Try downloading with gdown"""
+    try:
+        cmd = ['gdown', '--no-cookies', '-O', output_path, file_id]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True
+        return False
+    except Exception as e:
+        return False
+
+def get_folder_contents(folder_id):
+    """Get folder contents by parsing the Google Drive webpage"""
+    try:
+        url = f'https://drive.google.com/drive/folders/{folder_id}'
+        curl_cmd = [
+            'curl', '-L', '-s',
+            '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            url
+        ]
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=60)
+        html_content = result.stdout
+
+        items = []
+        seen_ids = set()
+
+        # Multiple patterns to extract file/folder info from Google Drive's JS data
+
+        # Pattern 1: Modern format ["id","name",...,"mimetype",...]
+        pattern1 = r'\["([\w-]{20,50})","([^"]{1,300})"(?:,(?:\[[^\]]*\]|null|"[^"]*"|\d+)){0,10},"(application/vnd\.google-apps\.[^"]*|[^"]*)"'
+        for match in re.finditer(pattern1, html_content):
+            fid, fname, mime = match.groups()
+            if fid not in seen_ids and fid != folder_id and len(fid) >= 20:
+                seen_ids.add(fid)
+                is_folder = 'folder' in mime.lower()
+                try:
+                    fname = fname.encode('utf-8').decode('unicode_escape')
+                except:
+                    pass
+                items.append({'id': fid, 'name': fname, 'is_folder': is_folder})
+
+        # Pattern 2: Simple ID-name pairs
+        pattern2 = r'\["([\w-]{25,45})","([^"\\]{1,200})"'
+        for match in re.finditer(pattern2, html_content):
+            fid, fname = match.groups()
+            if fid not in seen_ids and fid != folder_id:
+                seen_ids.add(fid)
+                try:
+                    fname = fname.encode('utf-8').decode('unicode_escape')
+                except:
+                    pass
+                items.append({'id': fid, 'name': fname, 'is_folder': None})
+
+        # Pattern 3: data-id attributes
+        pattern3 = r'data-id="([\w-]{20,50})"[^>]*?(?:aria-label|title)="([^"]+)"'
+        for match in re.finditer(pattern3, html_content):
+            fid, fname = match.groups()
+            if fid not in seen_ids and fid != folder_id:
+                seen_ids.add(fid)
+                items.append({'id': fid, 'name': fname, 'is_folder': None})
+
+        return items
+
+    except Exception as e:
+        print(f"Error getting folder contents: {e}")
+        return []
+
+def is_google_folder(item_id):
+    """Check if an item is a folder"""
+    try:
+        curl_cmd = [
+            'curl', '-s', '-I', '-L',
+            '-A', 'Mozilla/5.0',
+            f'https://drive.google.com/drive/folders/{item_id}'
+        ]
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=15)
+        return 'text/html' in result.stdout and '200' in result.stdout[:100]
+    except:
+        return False
+
+def sanitize_filename(name):
+    """Make filename safe for filesystem"""
+    # Remove/replace invalid characters
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    name = name.strip('. ')
+    return name if name else 'unnamed'
+
+def recursive_download(folder_id, output_dir, depth=0, max_depth=15):
+    """Recursively download all files from a Google Drive folder"""
+
+    if depth > max_depth:
+        print(f"{'  '*depth}Reached max depth, stopping")
+        return
+
+    indent = '  ' * depth
+    print(f"{indent}Scanning folder: {folder_id[:20]}...")
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    items = get_folder_contents(folder_id)
+
+    if not items:
+        print(f"{indent}No items found or folder not accessible")
+        return
+
+    print(f"{indent}Found {len(items)} items")
+
+    for item in items:
+        name = sanitize_filename(item['name'])
+        item_id = item['id']
+
+        # Determine if folder
+        is_folder = item.get('is_folder')
+        if is_folder is None:
+            is_folder = is_google_folder(item_id)
+
+        if is_folder:
+            print(f"{indent}  [FOLDER] {name}")
+            subfolder = os.path.join(output_dir, name)
+            recursive_download(item_id, subfolder, depth + 1, max_depth)
+        else:
+            print(f"{indent}  [FILE] {name}")
+            output_path = os.path.join(output_dir, name)
+
+            # Skip existing files
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print(f"{indent}    Exists, skipping")
+                continue
+
+            # Try gdown first, then curl
+            success = download_with_gdown(item_id, output_path)
+            if not success:
+                success = download_file_with_curl(item_id, output_path)
+
+            if success:
+                size = os.path.getsize(output_path)
+                print(f"{indent}    OK ({size:,} bytes)")
+            else:
+                print(f"{indent}    FAILED")
+
+            # Rate limiting
+            time.sleep(0.3)
+
+def main():
+    folder_id = os.environ.get('FOLDER_ID', '')
+    output_dir = os.environ.get('OUTPUT_DIR', '.')
+
+    if not folder_id:
+        print("ERROR: No folder ID provided")
+        sys.exit(1)
+
+    print("=" * 50)
+    print(f"Google Drive Folder Downloader")
+    print(f"Folder ID: {folder_id}")
+    print(f"Output: {output_dir}")
+    print("=" * 50)
+    print()
+
+    recursive_download(folder_id, output_dir)
+
+    # Summary
+    file_count = sum(1 for _ in Path(output_dir).rglob('*') if _.is_file())
+    print()
+    print("=" * 50)
+    print(f"Download complete! Total files: {file_count}")
+    print("=" * 50)
+
+if __name__ == "__main__":
+    main()
+PYTHON_SCRIPT
+
+          # First try gdown's native folder download
           cd "$GDRIVE_DOWNLOAD_DIR"
 
-          # Try gdown with folder flag (recursively downloads all contents)
-          if gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" --remaining-ok 2>&1; then
-            echo "gdown folder download completed"
+          echo "Trying gdown native folder download..."
+          if gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" 2>&1; then
+            echo "gdown succeeded!"
           else
-            echo "gdown folder download had issues, trying alternative method..."
+            echo ""
+            echo "gdown native download failed, using recursive Python script..."
+            echo ""
 
-            # Alternative: Use gdown with fuzzy flag for problematic folders
-            gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" --fuzzy --remaining-ok 2>&1 || true
+            # Use our comprehensive recursive script
+            FOLDER_ID="$FOLDER_ID" OUTPUT_DIR="$GDRIVE_DOWNLOAD_DIR" python3 /tmp/gdrive_download.py
           fi
 
           cd -
+
+          # Cleanup
+          rm -f /tmp/gdrive_download.py /tmp/gdrive_cookies.txt /tmp/gdrive_temp_response
 
           # Count downloaded files
           DOWNLOADED_COUNT=$(find "$GDRIVE_DOWNLOAD_DIR" -type f 2>/dev/null | wc -l)
@@ -575,7 +845,7 @@ jobs:
 
           # REDUCED to 45MB for faster, more reliable pushes
           SPLIT_THRESHOLD_MB=45
-          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
+          SPLIT_THRESHOLD_BYTES=$((SPLIT_THRESHOLD_MB * 1024 * 1024))
 
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
