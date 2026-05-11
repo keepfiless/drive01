@@ -31,7 +31,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade gdown requests
+          pip install --upgrade gdown requests beautifulsoup4
 
       - name: Extract Folder ID and Download Files Recursively
         id: download
@@ -40,10 +40,11 @@ jobs:
           import os
           import re
           import sys
+          import json
           import gdown
           import requests
           from pathlib import Path
-          from collections import deque
+          from bs4 import BeautifulSoup
 
           # Get the folder URL from input
           folder_url = "${{ github.event.inputs.drive_folder_url }}"
@@ -63,7 +64,7 @@ jobs:
 
           # Create download directory with sanitized name
           if custom_folder_name:
-              safe_name = re.sub(r'[<>:"/\\|?*&]', '_', custom_folder_name)
+              safe_name = re.sub(r'[<>:"/\\|?*$&]', '_', custom_folder_name)
               base_download_dir = f"downloads/{safe_name}"
           else:
               base_download_dir = f"downloads/drive_folder_{root_folder_id[:8]}"
@@ -74,7 +75,7 @@ jobs:
           # Session for requests
           session = requests.Session()
           session.headers.update({
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
           })
 
           downloaded_count = 0
@@ -83,49 +84,83 @@ jobs:
           processed_folders = set()
           processed_files = set()
 
-          def get_folder_name(folder_id):
-              """Try to get folder name from Google Drive page"""
+          def get_folder_contents(folder_id):
+              """Get folder contents using Google Drive's export API"""
+              files = []
+              folders = []
+
               try:
+                  # Use gdown's internal method to get folder contents
                   url = f"https://drive.google.com/drive/folders/{folder_id}"
-                  response = session.get(url, timeout=30)
-                  # Try to extract folder name from title
-                  title_match = re.search(r'<title>([^<]+)</title>', response.text)
-                  if title_match:
-                      title = title_match.group(1)
-                      # Remove " - Google Drive" suffix
-                      title = re.sub(r'\s*-\s*Google Drive\s*$', '', title)
-                      if title and title != "Google Drive":
-                          # Sanitize folder name
-                          safe_title = re.sub(r'[<>:"/\\|?*&]', '_', title)
-                          return safe_title
-              except:
-                  pass
-              return None
 
-          def scan_folder(folder_id):
-              """Scan a Google Drive folder and return file IDs and subfolder IDs"""
-              url = f"https://drive.google.com/drive/folders/{folder_id}"
-              file_ids = []
-              subfolder_ids = []
-
-              try:
+                  # Try to get folder contents via the webpage
                   response = session.get(url, timeout=30)
 
-                  # Find all file IDs in the page
-                  found_files = re.findall(r'/file/d/([a-zA-Z0-9_-]+)', response.text)
-                  file_ids = list(dict.fromkeys(found_files))  # Remove duplicates
+                  if response.status_code != 200:
+                      print(f"    Warning: Could not access folder (status {response.status_code})")
+                      return files, folders
 
-                  # Find all subfolder IDs in the page (exclude the current folder)
-                  found_folders = re.findall(r'/folders/([a-zA-Z0-9_-]+)', response.text)
-                  found_folders = list(dict.fromkeys(found_folders))
-                  subfolder_ids = [f for f in found_folders if f != folder_id]
+                  html = response.text
+
+                  # Method 1: Look for data in script tags (Google embeds JSON data)
+                  # Find all script tags that might contain file data
+                  script_pattern = r'\["([a-zA-Z0-9_-]{20,})"[^\]]*"([^"]+)"[^\]]*"(application/vnd\.google-apps\.folder|[^"]+)"'
+                  matches = re.findall(script_pattern, html)
+
+                  for match in matches:
+                      item_id, name, mime_type = match
+                      if item_id != folder_id:  # Skip current folder
+                          if 'folder' in mime_type.lower():
+                              folders.append({'id': item_id, 'name': name})
+                          else:
+                              files.append({'id': item_id, 'name': name})
+
+                  # Method 2: Alternative pattern for newer Google Drive pages
+                  if not files and not folders:
+                      # Look for file entries in the page
+                      file_pattern = r'data-id="([a-zA-Z0-9_-]{20,})"[^>]*>([^<]+)<'
+                      matches = re.findall(file_pattern, html)
+                      for item_id, name in matches:
+                          if item_id != folder_id:
+                              files.append({'id': item_id, 'name': name.strip()})
+
+                  # Method 3: Try parsing embedded JSON data
+                  if not files and not folders:
+                      # Look for JSON-like structures with file info
+                      json_pattern = r'\[(?:"[a-zA-Z0-9_-]{25,}"[,\s]*){1,}'
+
+                      # Extract IDs that look like Drive file/folder IDs
+                      all_ids = re.findall(r'"([a-zA-Z0-9_-]{25,45})"', html)
+                      unique_ids = list(dict.fromkeys(all_ids))
+
+                      # Filter out the current folder and common false positives
+                      for item_id in unique_ids:
+                          if item_id != folder_id and len(item_id) >= 25 and len(item_id) <= 45:
+                              # Try to determine if it's a file or folder by checking the URL
+                              check_url = f"https://drive.google.com/file/d/{item_id}/view"
+                              try:
+                                  check_resp = session.head(check_url, allow_redirects=True, timeout=5)
+                                  if check_resp.status_code == 200:
+                                      files.append({'id': item_id, 'name': f'file_{item_id[:8]}'})
+                                  else:
+                                      # Might be a folder
+                                      folder_check = f"https://drive.google.com/drive/folders/{item_id}"
+                                      folder_resp = session.head(folder_check, allow_redirects=True, timeout=5)
+                                      if folder_resp.status_code == 200:
+                                          folders.append({'id': item_id, 'name': f'folder_{item_id[:8]}'})
+                              except:
+                                  pass
+
+                              # Limit checks to avoid too many requests
+                              if len(files) + len(folders) >= 50:
+                                  break
 
               except Exception as e:
-                  print(f"  Warning: Could not scan folder {folder_id}: {e}")
+                  print(f"    Warning: Error scanning folder: {e}")
 
-              return file_ids, subfolder_ids
+              return files, folders
 
-          def download_file(file_id, target_dir):
+          def download_file(file_id, file_name, target_dir):
               """Download a single file to target directory"""
               global downloaded_count, failed_count, failed_files
 
@@ -135,65 +170,91 @@ jobs:
 
               try:
                   file_url = f"https://drive.google.com/uc?id={file_id}&confirm=t"
+                  output_path = os.path.join(target_dir, "")
+
                   output = gdown.download(
                       file_url,
-                      output=f"{target_dir}/",
+                      output=output_path,
                       quiet=False,
                       fuzzy=True
                   )
 
                   if output and os.path.exists(output):
                       file_size = os.path.getsize(output)
-                      print(f"    ✓ Downloaded: {os.path.basename(output)} ({file_size} bytes)")
+                      print(f"      ✓ Downloaded: {os.path.basename(output)} ({file_size} bytes)")
                       downloaded_count += 1
                   else:
-                      print(f"    ✗ Download returned no file")
+                      print(f"      ✗ Download returned no file")
                       failed_count += 1
                       failed_files.append(file_id)
 
               except Exception as e:
-                  print(f"    ✗ Failed: {e}")
+                  print(f"      ✗ Failed: {e}")
                   failed_count += 1
                   failed_files.append(file_id)
 
-          def process_folder_recursive(folder_id, current_path, depth=0):
+          def process_folder_recursive(folder_id, current_path, folder_name="root", depth=0):
               """Recursively process folder and all subfolders"""
-              global processed_folders
+              global processed_folders, downloaded_count
 
               if folder_id in processed_folders:
                   return
               processed_folders.add(folder_id)
 
               indent = "  " * depth
-              print(f"\n{indent}📁 Processing folder: {folder_id}")
+              print(f"\n{indent}📁 [{folder_name}] (ID: {folder_id[:12]}...)")
               print(f"{indent}   Path: {current_path}")
 
               # Ensure directory exists
               Path(current_path).mkdir(parents=True, exist_ok=True)
 
-              # Scan folder for files and subfolders
-              file_ids, subfolder_ids = scan_folder(folder_id)
+              # Get folder contents
+              files, subfolders = get_folder_contents(folder_id)
 
-              print(f"{indent}   Found {len(file_ids)} files, {len(subfolder_ids)} subfolders")
+              print(f"{indent}   Found {len(files)} files, {len(subfolders)} subfolders")
 
               # Download files in current folder
-              for i, file_id in enumerate(file_ids, 1):
+              for i, file_info in enumerate(files, 1):
+                  file_id = file_info['id']
+                  file_name = file_info.get('name', f'file_{file_id[:8]}')
                   if file_id not in processed_files:
-                      print(f"{indent}   [{i}/{len(file_ids)}] Downloading file: {file_id}")
-                      download_file(file_id, current_path)
+                      print(f"{indent}   [{i}/{len(files)}] Downloading: {file_name}")
+                      download_file(file_id, file_name, current_path)
 
               # Process subfolders recursively
-              for subfolder_id in subfolder_ids:
+              for subfolder_info in subfolders:
+                  subfolder_id = subfolder_info['id']
+                  subfolder_name = subfolder_info.get('name', f'folder_{subfolder_id[:8]}')
+                  # Sanitize folder name
+                  safe_subfolder_name = re.sub(r'[<>:"/\\|?*$&]', '_', subfolder_name)
+
                   if subfolder_id not in processed_folders:
-                      # Try to get folder name
-                      folder_name = get_folder_name(subfolder_id)
-                      if not folder_name:
-                          folder_name = f"folder_{subfolder_id[:8]}"
+                      subfolder_path = os.path.join(current_path, safe_subfolder_name)
+                      process_folder_recursive(subfolder_id, subfolder_path, subfolder_name, depth + 1)
 
-                      subfolder_path = os.path.join(current_path, folder_name)
-                      process_folder_recursive(subfolder_id, subfolder_path, depth + 1)
+          def download_with_gdown_folder(folder_id, output_dir):
+              """Use gdown's built-in folder download as primary method"""
+              global downloaded_count
 
-          # Start recursive download
+              print(f"\nUsing gdown.download_folder() for recursive download...")
+              url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+              try:
+                  gdown.download_folder(url=url, output=output_dir, quiet=False)
+
+                  # Count downloaded files
+                  downloaded_files = list(Path(output_dir).rglob('*'))
+                  file_count = len([f for f in downloaded_files if f.is_file()])
+                  downloaded_count = file_count
+
+                  print(f"\n✓ gdown.download_folder completed: {file_count} files")
+                  return True
+
+              except Exception as e:
+                  print(f"gdown.download_folder() failed: {e}")
+                  return False
+
+          # Start download process
           print("=" * 60)
           print("STARTING RECURSIVE FOLDER DOWNLOAD")
           print("=" * 60)
@@ -201,34 +262,31 @@ jobs:
           print(f"Destination: {base_download_dir}")
           print("=" * 60)
 
-          # Process the root folder and all subfolders
-          process_folder_recursive(root_folder_id, base_download_dir)
+          # Try gdown.download_folder first (most reliable for public folders)
+          success = download_with_gdown_folder(root_folder_id, base_download_dir)
 
-          # If no files found with scanning, try gdown.download_folder as fallback
-          if downloaded_count == 0:
+          # If gdown folder download fails or gets 0 files, try manual scanning
+          if not success or downloaded_count == 0:
               print("\n" + "=" * 60)
-              print("No files found with scanning, trying gdown.download_folder()...")
+              print("Trying manual recursive scan method...")
               print("=" * 60)
-              try:
-                  url = f"https://drive.google.com/drive/folders/{root_folder_id}"
-                  gdown.download_folder(url=url, output=base_download_dir, quiet=False, remaining_ok=True)
-                  downloaded_files = list(Path(base_download_dir).rglob('*'))
-                  downloaded_count = len([f for f in downloaded_files if f.is_file()])
-              except Exception as e:
-                  print(f"Folder download failed: {e}")
+              downloaded_count = 0  # Reset counter
+              processed_folders.clear()
+              processed_files.clear()
+              process_folder_recursive(root_folder_id, base_download_dir, "root")
 
           # Final summary
           print("")
           print("=" * 60)
           print("DOWNLOAD SUMMARY")
           print("=" * 60)
-          print(f"📁 Folders processed: {len(processed_folders)}")
+          print(f"📁 Folders processed: {len(processed_folders) if processed_folders else 1}")
           print(f"✓ Successfully downloaded: {downloaded_count} files")
           print(f"✗ Failed: {failed_count} files")
 
           if failed_files:
               print(f"\nFailed file IDs:")
-              for fid in failed_files[:10]:  # Show first 10
+              for fid in failed_files[:10]:
                   print(f"  - https://drive.google.com/file/d/{fid}")
               if len(failed_files) > 10:
                   print(f"  ... and {len(failed_files) - 10} more")
@@ -236,28 +294,32 @@ jobs:
           # List all downloaded files with folder structure
           print(f"\n📂 Folder structure in {base_download_dir}:")
           for f in sorted(Path(base_download_dir).rglob('*')):
-              if f.is_file():
-                  rel_path = f.relative_to(base_download_dir)
+              rel_path = f.relative_to(base_download_dir)
+              if f.is_dir():
+                  print(f"  📁 {rel_path}/")
+              elif f.is_file():
                   size_mb = f.stat().st_size / (1024 * 1024)
                   print(f"  📄 {rel_path} ({size_mb:.2f} MB)")
-              elif f.is_dir():
-                  rel_path = f.relative_to(base_download_dir)
-                  print(f"  📁 {rel_path}/")
 
           # Write output for next steps
+          folders_processed = len(processed_folders) if processed_folders else 1
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"download_dir={base_download_dir}\n")
               f.write(f"downloaded_count={downloaded_count}\n")
               f.write(f"failed_count={failed_count}\n")
-              f.write(f"folders_processed={len(processed_folders)}\n")
+              f.write(f"folders_processed={folders_processed}\n")
 
           # Only fail if NO files were downloaded
           if downloaded_count == 0:
               print("\n❌ ERROR: No files were downloaded!")
-              print("Make sure the Google Drive folder is publicly shared.")
+              print("\nTroubleshooting:")
+              print("1. Make sure the Google Drive folder is publicly shared")
+              print("   (Right-click folder → Share → Anyone with the link)")
+              print("2. The folder might be empty")
+              print("3. Files might require special permissions")
               sys.exit(1)
           else:
-              print(f"\n✅ Download completed! {downloaded_count} files from {len(processed_folders)} folders ready to commit.")
+              print(f"\n✅ Download completed! {downloaded_count} files from {folders_processed} folders ready to commit.")
 
           EOF
 
