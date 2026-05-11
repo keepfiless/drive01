@@ -1,0 +1,227 @@
+name: 02 - Download Google Drive Folder
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_folder_url:
+        description: 'Google Drive Folder URL (e.g., https://drive.google.com/drive/folders/FOLDER_ID)'
+        required: true
+        type: string
+      folder_name:
+        description: 'Custom folder name (optional - leave empty to auto-generate)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade gdown requests
+
+      - name: Extract Folder ID and Download Files
+        id: download
+        run: |
+          python << 'EOF'
+          import os
+          import re
+          import sys
+          import gdown
+          import requests
+          from pathlib import Path
+
+          # Get the folder URL from input
+          folder_url = "${{ github.event.inputs.drive_folder_url }}"
+          custom_folder_name = "${{ github.event.inputs.folder_name }}".strip()
+
+          # Extract folder ID from URL
+          folder_id_match = re.search(r'folders/([a-zA-Z0-9_-]+)', folder_url)
+          if not folder_id_match:
+              folder_id_match = re.search(r'id=([a-zA-Z0-9_-]+)', folder_url)
+
+          if not folder_id_match:
+              print("Error: Could not extract folder ID from URL")
+              sys.exit(1)
+
+          folder_id = folder_id_match.group(1)
+          print(f"Folder ID: {folder_id}")
+
+          # Create download directory with sanitized name
+          if custom_folder_name:
+              safe_name = re.sub(r'[<>:"/\\|?*&]', '_', custom_folder_name)
+              download_dir = f"downloads/{safe_name}"
+          else:
+              download_dir = f"downloads/drive_folder_{folder_id[:8]}"
+
+          Path(download_dir).mkdir(parents=True, exist_ok=True)
+          print(f"Download directory: {download_dir}")
+
+          url = f"https://drive.google.com/drive/folders/{folder_id}"
+          print(f"Starting download from: {url}")
+          print("=" * 50)
+
+          # First, try to get all file IDs from the folder page
+          print("Scanning folder for files...")
+
+          try:
+              session = requests.Session()
+              session.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              })
+              response = session.get(url)
+
+              # Find all file IDs in the page
+              file_ids = re.findall(r'/file/d/([a-zA-Z0-9_-]+)', response.text)
+              file_ids = list(dict.fromkeys(file_ids))  # Remove duplicates, keep order
+
+              print(f"Found {len(file_ids)} files in folder")
+          except Exception as e:
+              print(f"Could not scan folder: {e}")
+              file_ids = []
+
+          downloaded_count = 0
+          failed_count = 0
+          failed_files = []
+
+          if file_ids:
+              print("=" * 50)
+              print("Downloading files one by one...")
+              print("=" * 50)
+
+              for i, file_id in enumerate(file_ids, 1):
+                  print(f"\n[{i}/{len(file_ids)}] Downloading file ID: {file_id}")
+
+                  try:
+                      # Try download with confirmation bypass for large files
+                      file_url = f"https://drive.google.com/uc?id={file_id}&confirm=t"
+                      output = gdown.download(
+                          file_url,
+                          output=f"{download_dir}/",
+                          quiet=False,
+                          fuzzy=True
+                      )
+
+                      if output and os.path.exists(output):
+                          file_size = os.path.getsize(output)
+                          print(f"  ✓ Downloaded: {os.path.basename(output)} ({file_size} bytes)")
+                          downloaded_count += 1
+                      else:
+                          print(f"  ✗ Download returned no file")
+                          failed_count += 1
+                          failed_files.append(file_id)
+
+                  except Exception as e:
+                      print(f"  ✗ Failed: {e}")
+                      failed_count += 1
+                      failed_files.append(file_id)
+                      # Continue to next file, don't stop!
+                      continue
+
+          else:
+              # Fallback: try gdown.download_folder directly
+              print("Trying gdown.download_folder()...")
+              try:
+                  gdown.download_folder(url=url, output=download_dir, quiet=False)
+                  # Count downloaded files
+                  downloaded_files = list(Path(download_dir).rglob('*'))
+                  downloaded_count = len([f for f in downloaded_files if f.is_file()])
+              except Exception as e:
+                  print(f"Folder download failed: {e}")
+
+          # Final summary
+          print("")
+          print("=" * 50)
+          print("DOWNLOAD SUMMARY")
+          print("=" * 50)
+          print(f"✓ Successfully downloaded: {downloaded_count} files")
+          print(f"✗ Failed: {failed_count} files")
+
+          if failed_files:
+              print(f"\nFailed file IDs:")
+              for fid in failed_files:
+                  print(f"  - https://drive.google.com/file/d/{fid}")
+
+          # List all downloaded files
+          print(f"\nFiles in {download_dir}:")
+          for f in Path(download_dir).rglob('*'):
+              if f.is_file():
+                  size_mb = f.stat().st_size / (1024 * 1024)
+                  print(f"  - {f.name} ({size_mb:.2f} MB)")
+
+          # Write output for next steps
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"download_dir={download_dir}\n")
+              f.write(f"downloaded_count={downloaded_count}\n")
+              f.write(f"failed_count={failed_count}\n")
+
+          # Only fail if NO files were downloaded
+          if downloaded_count == 0:
+              print("\n❌ ERROR: No files were downloaded!")
+              print("Make sure the Google Drive folder is publicly shared.")
+              sys.exit(1)
+          else:
+              print(f"\n✅ Download completed! {downloaded_count} files ready to commit.")
+
+          EOF
+
+      - name: List downloaded files
+        run: |
+          echo "📁 Downloaded files:"
+          if [ -d "downloads" ]; then
+            find downloads -type f -exec ls -lh {} \;
+            echo ""
+            echo "Total size:"
+            du -sh downloads/
+          else
+            echo "No downloads folder found"
+          fi
+
+      - name: Commit and push files
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          # Configure git for large files
+          git config --local http.postBuffer 524288000
+
+          # Add all downloaded files
+          git add downloads/
+
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No new files to commit"
+          else
+            git commit -m "📥 Downloaded ${{ steps.download.outputs.downloaded_count }} files from Google Drive"
+            git push
+            echo "✅ Files committed and pushed successfully!"
+          fi
+
+      - name: Summary
+        run: |
+          echo "## 📥 Download Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Source:** ${{ github.event.inputs.drive_folder_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ✓ Downloaded | ${{ steps.download.outputs.downloaded_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✗ Failed | ${{ steps.download.outputs.failed_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Saved to:** \`${{ steps.download.outputs.download_dir }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          find downloads -type f -exec ls -lh {} \; >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No files found"
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
