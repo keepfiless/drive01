@@ -28,7 +28,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install gdown requests beautifulsoup4
+          pip install --upgrade gdown
 
       - name: Extract Folder ID and Download Files
         id: download
@@ -37,9 +37,7 @@ jobs:
           import os
           import re
           import sys
-          import time
           import gdown
-          import requests
           from pathlib import Path
 
           # Get the folder URL from input
@@ -59,16 +57,13 @@ jobs:
           folder_id = folder_id_match.group(1)
           print(f"Folder ID: {folder_id}")
 
-          # Create download directory
+          # Create download directory with sanitized name
           if custom_folder_name:
-              download_dir = f"downloads/{custom_folder_name}"
+              # Sanitize folder name - remove special characters
+              safe_name = re.sub(r'[<>:"/\\|?*&]', '_', custom_folder_name)
+              download_dir = f"downloads/{safe_name}"
           else:
-              # Try to get folder name from Google Drive
-              try:
-                  # Use gdown to get folder info
-                  download_dir = f"downloads/drive_folder_{folder_id[:8]}"
-              except:
-                  download_dir = f"downloads/drive_folder_{folder_id[:8]}"
+              download_dir = f"downloads/drive_folder_{folder_id[:8]}"
 
           Path(download_dir).mkdir(parents=True, exist_ok=True)
           print(f"Download directory: {download_dir}")
@@ -80,16 +75,15 @@ jobs:
           print(f"Starting download from: {url}")
           print("This may take a while for large files with virus scan...")
 
+          file_count = 0
+
           try:
               # Download folder with all files
-              # remaining_ok=True allows partial downloads if some files fail
-              # fuzzy=True helps with different URL formats
+              # Using only supported parameters
               gdown.download_folder(
                   url=url,
                   output=download_dir,
-                  quiet=False,
-                  use_cookies=False,
-                  remaining_ok=True
+                  quiet=False
               )
               print("Download completed!")
 
@@ -104,20 +98,43 @@ jobs:
                       print(f"  - {f.relative_to(download_dir)} ({size} bytes)")
 
           except Exception as e:
-              print(f"Error during download: {e}")
-              # Try alternative method with individual file handling
-              print("Attempting alternative download method...")
+              print(f"Error during folder download: {e}")
+              print("")
+              print("Trying to download files individually...")
 
-              # Get file list from folder
+              # Alternative: Get file list and download each file separately
               try:
-                  gdown.download_folder(
-                      url=url,
-                      output=download_dir,
-                      quiet=False,
-                      use_cookies=False,
-                      remaining_ok=True,
-                      skip_download=False
-                  )
+                  import requests
+                  from bs4 import BeautifulSoup
+
+                  # Try to get folder contents
+                  session = requests.Session()
+                  response = session.get(f"https://drive.google.com/drive/folders/{folder_id}")
+
+                  # Look for file IDs in the page
+                  file_ids = re.findall(r'/file/d/([a-zA-Z0-9_-]+)', response.text)
+                  file_ids = list(set(file_ids))  # Remove duplicates
+
+                  if file_ids:
+                      print(f"Found {len(file_ids)} files in folder")
+
+                      for i, file_id in enumerate(file_ids, 1):
+                          print(f"Downloading file {i}/{len(file_ids)}: {file_id}")
+                          try:
+                              file_url = f"https://drive.google.com/uc?id={file_id}"
+                              output_path = f"{download_dir}/"
+                              gdown.download(file_url, output_path, quiet=False, fuzzy=True)
+                              file_count += 1
+                          except Exception as file_error:
+                              print(f"  Failed to download file {file_id}: {file_error}")
+                              continue
+
+                      print(f"Downloaded {file_count} files")
+                  else:
+                      print("Could not find any files in the folder")
+                      print("Make sure the folder is publicly shared!")
+                      sys.exit(1)
+
               except Exception as e2:
                   print(f"Alternative method also failed: {e2}")
                   sys.exit(1)
@@ -127,12 +144,20 @@ jobs:
               f.write(f"download_dir={download_dir}\n")
               f.write(f"file_count={file_count}\n")
 
+          if file_count == 0:
+              print("WARNING: No files were downloaded!")
+              print("Make sure the Google Drive folder is publicly shared (Anyone with the link can view)")
+
           EOF
 
       - name: List downloaded files
         run: |
           echo "📁 Downloaded files:"
-          find downloads -type f -exec ls -lh {} \;
+          if [ -d "downloads" ]; then
+            find downloads -type f -exec ls -lh {} \;
+          else
+            echo "No downloads folder found"
+          fi
 
       - name: Commit and push files
         run: |
@@ -161,5 +186,5 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Files:" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          find downloads -type f -exec ls -lh {} \; >> $GITHUB_STEP_SUMMARY
+          find downloads -type f -exec ls -lh {} \; >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No files found"
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
