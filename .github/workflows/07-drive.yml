@@ -46,7 +46,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install gdown requests
+          pip install gdown requests beautifulsoup4
 
       - name: Extract folder ID from URL
         id: extract_id
@@ -71,79 +71,179 @@ jobs:
           import os
           import json
           import time
+          import re
           import requests
-          from urllib.parse import urlencode
+          from bs4 import BeautifulSoup
 
-          def get_folder_contents(folder_id, retries=3, delay=5):
-              """Get contents of a Google Drive folder using the embed page parser."""
+          def get_folder_contents(folder_id, session, retries=3):
+              """Get contents of a Google Drive folder by parsing the page."""
               files = []
               folders = []
 
+              url = f"https://drive.google.com/drive/folders/{folder_id}"
+
               for attempt in range(retries):
                   try:
-                      # Use gdown's internal method to list folder contents
-                      import gdown
-                      from gdown.download_folder import _get_session, _get_folder_list
+                      response = session.get(url, timeout=30)
 
-                      sess = _get_session()
-                      url = f"https://drive.google.com/drive/folders/{folder_id}"
+                      if response.status_code != 200:
+                          print(f"  Warning: Got status {response.status_code}")
+                          time.sleep(5 * (attempt + 1))
+                          continue
 
-                      try:
-                          folder_list = _get_folder_list(sess, url)
-                          for item in folder_list:
-                              if item[0] == 'folder':
-                                  folders.append({
-                                      'id': item[1],
-                                      'name': item[2],
-                                      'type': 'folder'
-                                  })
-                              else:
+                      content = response.text
+
+                      # Parse the JavaScript data in the page
+                      # Look for patterns like: ["file_id","file_name"
+                      # The data is embedded in JavaScript
+
+                      # Method 1: Find all file/folder IDs and names using regex patterns
+                      # Google Drive embeds data in a specific format
+
+                      # Pattern for files/folders: data contains arrays with IDs
+                      # Looking for patterns like: [null,["FILE_ID"],"FILENAME"
+
+                      # Try to find the data script
+                      pattern = r'\["([a-zA-Z0-9_-]{25,})"\s*,\s*"([^"]+\.[\w]+)"'
+                      matches = re.findall(pattern, content)
+
+                      for file_id, file_name in matches:
+                          if len(file_id) > 20:  # Valid Google Drive ID length
+                              files.append({
+                                  'id': file_id,
+                                  'name': file_name,
+                                  'type': 'file'
+                              })
+
+                      # Pattern for folders (no extension)
+                      folder_pattern = r'\["([a-zA-Z0-9_-]{25,})"\s*,\s*"([^"\.]+)"\s*,\s*"application/vnd\.google-apps\.folder"'
+                      folder_matches = re.findall(folder_pattern, content)
+
+                      for folder_id_match, folder_name in folder_matches:
+                          if len(folder_id_match) > 20:
+                              folders.append({
+                                  'id': folder_id_match,
+                                  'name': folder_name,
+                                  'type': 'folder'
+                              })
+
+                      # Alternative pattern - look for the key data structure
+                      # Google uses a format like: ,["ID",["ID"],"name",
+                      alt_pattern = r',\["([a-zA-Z0-9_-]{20,})",\["[a-zA-Z0-9_-]+"\],"([^"]+)"'
+                      alt_matches = re.findall(alt_pattern, content)
+
+                      seen_ids = set(f['id'] for f in files) | set(f['id'] for f in folders)
+
+                      for item_id, item_name in alt_matches:
+                          if item_id not in seen_ids and len(item_id) > 20:
+                              if '.' in item_name:
                                   files.append({
-                                      'id': item[1],
-                                      'name': item[2],
+                                      'id': item_id,
+                                      'name': item_name,
                                       'type': 'file'
                                   })
-                          return files, folders
-                      except Exception as e:
-                          print(f"gdown method failed: {e}, trying alternative...")
+                              else:
+                                  folders.append({
+                                      'id': item_id,
+                                      'name': item_name,
+                                      'type': 'folder'
+                                  })
+                              seen_ids.add(item_id)
 
-                      # Alternative: parse the folder page directly
-                      response = sess.get(url)
-                      if response.status_code == 200:
-                          import re
-                          # Look for file/folder data in the page
-                          # This is a simplified parser
+                      if files or folders:
                           return files, folders
+
+                      # If no matches, try another pattern
+                      # Look for the specific structure Google uses
+                      data_pattern = r'data:\s*(\[.*?\])\s*[,}]'
 
                   except Exception as e:
-                      print(f"Attempt {attempt + 1} failed: {e}")
+                      print(f"  Attempt {attempt + 1} failed: {e}")
                       if attempt < retries - 1:
-                          time.sleep(delay * (attempt + 1))
+                          time.sleep(5 * (attempt + 1))
 
               return files, folders
 
-          def list_all_files(folder_id, base_path=""):
-              """Recursively list all files in a folder."""
+          def list_with_gdown(folder_id):
+              """Use gdown to list folder contents."""
+              import subprocess
+              import sys
+              import tempfile
+              import shutil
+
               all_files = []
 
-              print(f"Scanning folder: {folder_id} (path: {base_path or '/'})")
+              # Create a temporary directory
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  try:
+                      # Use gdown with --remaining-ok to handle partial downloads
+                      # and capture the output to parse file information
+                      url = f"https://drive.google.com/drive/folders/{folder_id}"
 
-              files, folders = get_folder_contents(folder_id)
+                      print(f"Using gdown to list folder contents...")
 
-              # Add files with their paths
-              for f in files:
-                  f['path'] = os.path.join(base_path, f['name']) if base_path else f['name']
-                  f['parent_id'] = folder_id
-                  all_files.append(f)
-                  print(f"  Found file: {f['name']}")
+                      # Run gdown and capture output
+                      # Increase timeout to 15 minutes to allow listing of large folders
+                      # gdown lists all files BEFORE downloading, so we capture the list even if download fails
+                      result = subprocess.run(
+                          [sys.executable, "-m", "gdown", "--folder", url, "--remaining-ok", "-O", tmpdir],
+                          capture_output=True,
+                          text=True,
+                          timeout=900
+                      )
 
-              # Recursively process subfolders
-              for folder in folders:
-                  folder_path = os.path.join(base_path, folder['name']) if base_path else folder['name']
-                  print(f"  Found folder: {folder['name']}")
-                  subfolder_files = list_all_files(folder['id'], folder_path)
-                  all_files.extend(subfolder_files)
-                  time.sleep(1)  # Small delay between folder requests
+                      output = result.stdout + result.stderr
+
+                      # Parse the output to extract file information
+                      # gdown outputs lines like: "Processing file FILE_ID FILENAME"
+                      # and "Retrieving folder FOLDER_ID FOLDERNAME"
+
+                      file_pattern = r'Processing file\s+([a-zA-Z0-9_-]+)\s+(.+)'
+                      folder_pattern = r'Retrieving folder\s+([a-zA-Z0-9_-]+)\s+(.+)'
+
+                      current_path = ""
+                      folder_stack = []
+
+                      for line in output.split('\n'):
+                          file_match = re.search(file_pattern, line)
+                          folder_match = re.search(folder_pattern, line)
+
+                          if folder_match:
+                              folder_id_match = folder_match.group(1)
+                              folder_name = folder_match.group(2).strip()
+                              # Track folder for path building
+                              print(f"  [FOLDER] {folder_name}")
+
+                          elif file_match:
+                              file_id = file_match.group(1)
+                              file_name = file_match.group(2).strip()
+                              all_files.append({
+                                  'id': file_id,
+                                  'name': file_name,
+                                  'path': file_name,  # Will be updated with folder structure
+                                  'type': 'file'
+                              })
+                              print(f"  [FILE] {file_name}")
+
+                      # Also walk the temp directory to get the actual structure
+                      for root, dirs, files in os.walk(tmpdir):
+                          rel_path = os.path.relpath(root, tmpdir)
+                          if rel_path == '.':
+                              rel_path = ''
+
+                          for f in files:
+                              file_path = os.path.join(rel_path, f) if rel_path else f
+                              # Try to find matching file in our list
+                              for item in all_files:
+                                  if item['name'] == f and 'full_path' not in item:
+                                      item['path'] = file_path
+                                      item['full_path'] = True
+                                      break
+
+                  except subprocess.TimeoutExpired:
+                      print("gdown timed out, using partial results")
+                  except Exception as e:
+                      print(f"Error with gdown: {e}")
 
               return all_files
 
@@ -154,93 +254,41 @@ jobs:
               print(f"Starting file listing for folder: {folder_id}")
               print("=" * 60)
 
-              # Use gdown's folder listing capability
-              import gdown
-              import tempfile
+              # Use gdown to list files (it will output file info during the process)
+              all_files = list_with_gdown(folder_id)
 
-              # Create a temp directory for gdown to work with
-              with tempfile.TemporaryDirectory() as tmpdir:
-                  try:
-                      # Get folder info using gdown's internal functions
-                      url = f"https://drive.google.com/drive/folders/{folder_id}"
+              # Create output directory
+              os.makedirs('file_list', exist_ok=True)
 
-                      # Use gdown to get the file list without downloading
-                      from gdown.download_folder import _get_session, _get_folder_list, _parse_folder_page
+              # Remove duplicates based on file ID
+              seen_ids = set()
+              unique_files = []
+              for f in all_files:
+                  if f['id'] not in seen_ids:
+                      seen_ids.add(f['id'])
+                      unique_files.append(f)
 
-                      sess = _get_session()
-                      all_items = []
-                      folders_to_scan = [(folder_id, "")]
+              all_files = unique_files
 
-                      while folders_to_scan:
-                          current_folder_id, current_path = folders_to_scan.pop(0)
-                          folder_url = f"https://drive.google.com/drive/folders/{current_folder_id}"
+              # Save file list to JSON
+              with open('file_list/all_files.json', 'w') as f:
+                  json.dump(all_files, f, indent=2)
 
-                          print(f"\nScanning: {current_path or '/'} ({current_folder_id})")
+              # Save summary
+              summary = {
+                  'total_files': len(all_files),
+                  'root_folder_id': folder_id
+              }
+              with open('file_list/summary.json', 'w') as f:
+                  json.dump(summary, f, indent=2)
 
-                          try:
-                              folder_list = _get_folder_list(sess, folder_url)
+              print("\n" + "=" * 60)
+              print(f"Total files found: {len(all_files)}")
+              print("=" * 60)
 
-                              for item in folder_list:
-                                  item_type, item_id, item_name = item[0], item[1], item[2]
-                                  item_path = os.path.join(current_path, item_name) if current_path else item_name
-
-                                  if item_type == 'folder':
-                                      folders_to_scan.append((item_id, item_path))
-                                      print(f"  [FOLDER] {item_name}")
-                                  else:
-                                      all_items.append({
-                                          'id': item_id,
-                                          'name': item_name,
-                                          'path': item_path,
-                                          'folder_id': current_folder_id,
-                                          'folder_path': current_path
-                                      })
-                                      print(f"  [FILE] {item_name}")
-
-                              # Delay between folder scans to avoid rate limiting
-                              time.sleep(2)
-
-                          except Exception as e:
-                              print(f"  Error scanning folder: {e}")
-                              # Add to retry list or skip
-                              continue
-
-                      # Save file list to JSON
-                      os.makedirs('file_list', exist_ok=True)
-
-                      # Save full list
-                      with open('file_list/all_files.json', 'w') as f:
-                          json.dump(all_items, f, indent=2)
-
-                      # Save summary
-                      summary = {
-                          'total_files': len(all_items),
-                          'root_folder_id': folder_id,
-                          'unique_folders': list(set(item['folder_path'] for item in all_items))
-                      }
-                      with open('file_list/summary.json', 'w') as f:
-                          json.dump(summary, f, indent=2)
-
-                      print("\n" + "=" * 60)
-                      print(f"Total files found: {len(all_items)}")
-                      print(f"Unique folders: {len(summary['unique_folders'])}")
-                      print("=" * 60)
-
-                      # Set output for GitHub Actions
-                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-                          f.write(f"total_files={len(all_items)}\n")
-
-                  except Exception as e:
-                      print(f"Error: {e}")
-                      import traceback
-                      traceback.print_exc()
-
-                      # Create empty file list on error
-                      os.makedirs('file_list', exist_ok=True)
-                      with open('file_list/all_files.json', 'w') as f:
-                          json.dump([], f)
-                      with open('file_list/summary.json', 'w') as f:
-                          json.dump({'total_files': 0, 'error': str(e)}, f)
+              # Set output for GitHub Actions
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write(f"total_files={len(all_files)}\n")
 
           if __name__ == "__main__":
               main()
@@ -260,6 +308,11 @@ jobs:
           echo "=== File Listing Summary ==="
           if [ -f file_list/summary.json ]; then
             cat file_list/summary.json | python -m json.tool
+          fi
+          echo ""
+          if [ -f file_list/all_files.json ]; then
+            echo "First 10 files:"
+            head -50 file_list/all_files.json
           fi
           echo ""
           echo "File list saved as artifact for download job"
@@ -327,12 +380,11 @@ jobs:
                   try:
                       url = f"https://drive.google.com/uc?id={file_id}"
 
-                      # Use gdown with quiet mode and confirmation bypass
+                      # Use gdown with fuzzy mode and confirmation bypass
                       cmd = [
                           sys.executable, "-m", "gdown",
                           "--fuzzy", url,
-                          "-O", output_path,
-                          "-q"
+                          "-O", output_path
                       ]
 
                       result = subprocess.run(
@@ -344,12 +396,21 @@ jobs:
 
                       if result.returncode == 0 and Path(output_path).exists():
                           size = Path(output_path).stat().st_size
-                          print(f"  ✓ Downloaded: {file_name} ({size / 1024 / 1024:.2f} MB)")
-                          return True
+                          if size > 0:
+                              print(f"  ✓ Downloaded: {file_name} ({size / 1024 / 1024:.2f} MB)")
+                              return True
+                          else:
+                              print(f"  ✗ Empty file: {file_name}")
+                              Path(output_path).unlink()
                       else:
                           print(f"  ✗ Failed (attempt {attempt + 1}): {file_name}")
                           if result.stderr:
-                              print(f"    Error: {result.stderr[:200]}")
+                              # Check for rate limit error
+                              if "Cannot retrieve" in result.stderr or "quota" in result.stderr.lower():
+                                  print(f"    Rate limited! Waiting longer...")
+                                  time.sleep(60 * (attempt + 1))
+                              else:
+                                  print(f"    Error: {result.stderr[:200]}")
 
                   except subprocess.TimeoutExpired:
                       print(f"  ⏱ Timeout (attempt {attempt + 1}): {file_name}")
@@ -358,7 +419,7 @@ jobs:
 
                   # Exponential backoff
                   if attempt < max_retries - 1:
-                      wait_time = 10 * (2 ** attempt)
+                      wait_time = 15 * (2 ** attempt)
                       print(f"    Waiting {wait_time}s before retry...")
                       time.sleep(wait_time)
 
@@ -387,6 +448,7 @@ jobs:
 
               if not all_files:
                   print("No files to download!")
+                  print("The listing phase may have failed. Check the list_files job logs.")
                   return
 
               print(f"\nTotal files to process: {len(all_files)}")
