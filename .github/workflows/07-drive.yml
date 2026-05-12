@@ -1,4 +1,4 @@
-name: 07 - Download Google Drive Files
+name: 06 - Download Google Drive Files
 
 on:
   workflow_dispatch:
@@ -53,29 +53,32 @@ jobs:
           echo "Downloading from Google Drive folder: $FOLDER_ID"
           echo "==============================================="
           echo ""
-          echo "NOTE: This workflow will automatically retry downloads if rate-limited by Google Drive."
-          echo ""
 
           cd downloads
 
           MAX_RETRIES=15
-          RETRY_COUNT=0
           SUCCESS=false
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Download attempt #$i/$MAX_RETRIES..."
 
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "Download attempt #$((RETRY_COUNT + 1))/$MAX_RETRIES..."
+            set +e # Do not exit on error
             gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID"
             EXIT_CODE=$?
+            set -e # Re-enable exit on error
+
             if [ $EXIT_CODE -eq 0 ]; then
+              echo "gdown reports success. All files downloaded."
               SUCCESS=true
               break
-            fi
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              # Linearly increasing backoff
-              WAIT_TIME=$((30 * RETRY_COUNT))
-              echo "gdown failed with exit code $EXIT_CODE. Retrying in $WAIT_TIME seconds..."
-              sleep $WAIT_TIME
+            else
+              echo "gdown exited with code $EXIT_CODE. This likely means some files failed to download due to rate limiting."
+              if [ $i -lt $MAX_RETRIES ]; then
+                  WAIT_TIME=$((60 * i)) # Increase wait time on each retry
+                  echo "Will retry in $WAIT_TIME seconds..."
+                  sleep $WAIT_TIME
+              else
+                  echo "Max retries reached. Download may be incomplete."
+              fi
             fi
           done
 
