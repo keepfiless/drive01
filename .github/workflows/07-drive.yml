@@ -7,176 +7,9 @@ on:
         description: 'Google Drive folder URL (public shared link)'
         required: true
         type: string
-      batch_size:
-        description: 'Number of files to download per batch (default: 25)'
-        required: false
-        default: '25'
-        type: string
-      delay_between_files:
-        description: 'Delay in seconds between individual files (default: 2)'
-        required: false
-        default: '2'
-        type: string
 
 jobs:
-  list_files:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    outputs:
-      folder_id: ${{ steps.extract_id.outputs.folder_id }}
-      total_files: ${{ steps.list.outputs.total_files }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install gdown
-
-      - name: Extract folder ID from URL
-        id: extract_id
-        run: |
-          URL="${{ github.event.inputs.drive_folder_url }}"
-          if [[ "$URL" =~ folders/([a-zA-Z0-9_-]+) ]]; then
-            FOLDER_ID="${BASH_REMATCH[1]}"
-          elif [[ "$URL" =~ id=([a-zA-Z0-9_-]+) ]]; then
-            FOLDER_ID="${BASH_REMATCH[1]}"
-          else
-            FOLDER_ID="$URL"
-          fi
-          echo "folder_id=$FOLDER_ID" >> $GITHUB_OUTPUT
-          echo "Extracted folder ID: $FOLDER_ID"
-
-      - name: List all files
-        id: list
-        env:
-          FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
-        run: |
-          python3 << 'EOF'
-          import os
-          import json
-          import time
-
-          # Use gdown's own internal machinery — the same code path that
-          # makes "gdown --folder" work on public shared folders.
-          import gdown
-          from gdown.download_folder import download_and_parse_google_drive_link
-
-          def walk_gdrive_tree(gdrive_file, path_prefix="", depth=0):
-              """Recursively walk a GDriveFile tree returned by gdown and
-              collect every non-folder leaf as {id, name, path}."""
-              indent = "  " * depth
-              all_files = []
-
-              children = getattr(gdrive_file, "children", None) or []
-              if not children:
-                  # Leaf file (no children attribute means it's a file)
-                  name = gdrive_file.name
-                  file_path = os.path.join(path_prefix, name) if path_prefix else name
-                  print(f"{indent}  [FILE] {name}")
-                  return [{"id": gdrive_file.id, "name": name, "path": file_path}]
-
-              files   = [c for c in children if not getattr(c, "is_folder", False)]
-              folders = [c for c in children if getattr(c, "is_folder", False)]
-
-              print(f"{indent}Folder '{gdrive_file.name}': "
-                    f"{len(files)} files, {len(folders)} sub-folders")
-
-              for f in files:
-                  name = f.name
-                  file_path = os.path.join(path_prefix, name) if path_prefix else name
-                  print(f"{indent}  [FILE] {name}")
-                  all_files.append({"id": f.id, "name": name, "path": file_path})
-
-              for folder in folders:
-                  name = folder.name
-                  sub_path = os.path.join(path_prefix, name) if path_prefix else name
-                  print(f"{indent}  [FOLDER] {name}")
-                  sub_files = walk_gdrive_tree(folder, sub_path, depth + 1)
-                  all_files.extend(sub_files)
-
-              return all_files
-
-          folder_id = os.environ["FOLDER_ID"]
-          url = f"https://drive.google.com/drive/folders/{folder_id}"
-
-          print("=" * 60)
-          print(f"Listing folder: {folder_id}")
-          print("=" * 60)
-
-          all_files = []
-          for attempt in range(3):
-              try:
-                  return_code, gdrive_file = download_and_parse_google_drive_link(
-                      url,
-                      quiet=False,
-                      use_cookies=False,
-                      remaining_ok=True,
-                  )
-                  all_files = walk_gdrive_tree(gdrive_file)
-                  break
-              except Exception as e:
-                  print(f"Attempt {attempt + 1} failed: {e}")
-                  if attempt < 2:
-                      time.sleep(10)
-
-          # Deduplicate by ID
-          seen = set()
-          unique_files = []
-          for f in all_files:
-              if f["id"] not in seen:
-                  seen.add(f["id"])
-                  unique_files.append(f)
-          all_files = unique_files
-
-          os.makedirs("file_list", exist_ok=True)
-          with open("file_list/all_files.json", "w") as fh:
-              json.dump(all_files, fh, indent=2)
-          with open("file_list/summary.json", "w") as fh:
-              json.dump({"total_files": len(all_files), "folder_id": folder_id}, fh, indent=2)
-
-          print(f"\nTotal files found: {len(all_files)}")
-          if all_files:
-              print("\nFirst 20 files:")
-              for f in all_files[:20]:
-                  print(f"  - {f['path']}")
-
-          github_output = os.environ.get("GITHUB_OUTPUT", "/dev/null")
-          with open(github_output, "a") as fh:
-              fh.write(f"total_files={len(all_files)}\n")
-          EOF
-
-      - name: Upload file list
-        uses: actions/upload-artifact@v4
-        with:
-          name: file-list
-          path: file_list/
-          retention-days: 1
-
-      - name: Display summary
-        run: |
-          echo "=== File Listing Summary ==="
-          cat file_list/summary.json
-          echo ""
-          echo "First 20 files:"
-          python3 -c "
-          import json
-          files = json.load(open('file_list/all_files.json'))
-          for f in files[:20]:
-              print(f['path'])
-          " 2>/dev/null || echo "No files found"
-
-  download_files:
-    needs: list_files
-    if: needs.list_files.outputs.total_files != '0'
+  download:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
@@ -195,121 +28,128 @@ jobs:
       - name: Install gdown
         run: pip install gdown
 
-      - name: Download file list
-        uses: actions/download-artifact@v4
-        with:
-          name: file-list
-          path: file_list/
+      - name: Extract folder ID from URL
+        id: extract_id
+        run: |
+          URL="${{ github.event.inputs.drive_folder_url }}"
+          if [[ "$URL" =~ folders/([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          elif [[ "$URL" =~ id=([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          else
+            FOLDER_ID="$URL"
+          fi
+          echo "folder_id=$FOLDER_ID" >> $GITHUB_OUTPUT
+          echo "Extracted folder ID: $FOLDER_ID"
 
       - name: Create downloads directory
         run: mkdir -p downloads
 
-      - name: Download files
+      - name: Download files from Google Drive
         env:
-          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
-          DELAY_BETWEEN_FILES: ${{ github.event.inputs.delay_between_files }}
+          FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
         run: |
-          python3 << 'EOF'
-          import os
-          import json
-          import time
-          import gdown
-          from pathlib import Path
+          echo "==============================================="
+          echo "Downloading from Google Drive folder: $FOLDER_ID"
+          echo "==============================================="
+          echo ""
+          echo "NOTE: This workflow will automatically retry downloads if rate-limited by Google Drive."
+          echo ""
 
-          def download_file(file_id, output_path, max_retries=3):
-              Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-              for attempt in range(max_retries):
-                  try:
-                      url = f"https://drive.google.com/uc?id={file_id}"
-                      result = gdown.download(url, output_path, quiet=False, fuzzy=True)
-                      if result and Path(output_path).exists() and Path(output_path).stat().st_size > 0:
-                          size_mb = Path(output_path).stat().st_size / 1024 / 1024
-                          print(f"  Downloaded ({size_mb:.2f} MB)")
-                          return True
-                  except Exception as e:
-                      print(f"  Attempt {attempt + 1} failed: {e}")
-                      if "quota" in str(e).lower() or "rate" in str(e).lower():
-                          time.sleep(60 * (attempt + 1))
-                  if attempt < max_retries - 1:
-                      time.sleep(10 * (attempt + 1))
-              return False
+          cd downloads
 
-          batch_size = int(os.environ.get('BATCH_SIZE', 25))
-          delay = int(os.environ.get('DELAY_BETWEEN_FILES', 2))
+          MAX_RETRIES=15
+          RETRY_COUNT=0
+          SUCCESS=false
 
-          with open('file_list/all_files.json', 'r') as f:
-              all_files = json.load(f)
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Download attempt #$((RETRY_COUNT + 1))/$MAX_RETRIES..."
+            gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID"
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 0 ]; then
+              SUCCESS=true
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              # Linearly increasing backoff
+              WAIT_TIME=$((30 * RETRY_COUNT))
+              echo "gdown failed with exit code $EXIT_CODE. Retrying in $WAIT_TIME seconds..."
+              sleep $WAIT_TIME
+            fi
+          done
 
-          if not all_files:
-              print("No files to download!")
-              exit(0)
+          cd ..
+          echo ""
 
-          # Collect already-downloaded paths to allow resuming
-          downloaded = set()
-          for root, dirs, files in os.walk('downloads'):
-              for f in files:
-                  if f not in ['README.md', '.gitkeep']:
-                      downloaded.add(f)
-                      downloaded.add(os.path.relpath(os.path.join(root, f), 'downloads'))
+          if [ "$SUCCESS" = "true" ]; then
+            echo "Download completed successfully!"
+          else
+            echo "Download may be incomplete after $MAX_RETRIES attempts."
+            echo "This may be due to persistent Google Drive rate limiting."
+            echo "You can try running the workflow again to download any remaining files."
+          fi
 
-          to_download = [
-              f for f in all_files
-              if f['path'] not in downloaded and f['name'] not in downloaded
-          ]
-          print(f"Total: {len(all_files)}, Already downloaded: {len(all_files) - len(to_download)}, To download: {len(to_download)}")
-
-          success = 0
-          failed = []
-          for i, f in enumerate(to_download):
-              print(f"\n[{i+1}/{len(to_download)}] {f['path']}")
-              output_path = os.path.join('downloads', f['path'])
-              if download_file(f['id'], output_path):
-                  success += 1
-              else:
-                  failed.append(f)
-              if i < len(to_download) - 1:
-                  time.sleep(delay)
-              if (i + 1) % batch_size == 0 and i < len(to_download) - 1:
-                  print(f"\nBatch complete. Waiting 30s...")
-                  time.sleep(30)
-
-          print(f"\n{'='*60}")
-          print(f"Downloaded: {success}, Failed: {len(failed)}")
-          if failed:
-              with open('file_list/failed.json', 'w') as f:
-                  json.dump(failed, f, indent=2)
-              print("Failed files:")
-              for f in failed:
-                  print(f"  - {f['path']}")
-          EOF
-
-      - name: Generate README files
+      - name: Generate README.md for each folder
         run: |
           find downloads -mindepth 1 -type d | while read -r folder; do
             folder_name=$(basename "$folder")
-            echo "# $folder_name" > "$folder/README.md"
-            echo "" >> "$folder/README.md"
-            echo "| File | Download |" >> "$folder/README.md"
-            echo "|------|----------|" >> "$folder/README.md"
+            readme_path="$folder/README.md"
+
+            echo "Creating README.md for: $folder_name"
+
+            echo "# $folder_name" > "$readme_path"
+            echo "" >> "$readme_path"
+            echo "## Files" >> "$readme_path"
+            echo "" >> "$readme_path"
+            echo "| File | Download |" >> "$readme_path"
+            echo "|------|----------|" >> "$readme_path"
+
             find "$folder" -maxdepth 1 -type f ! -name "README.md" | sort | while read -r file; do
               filename=$(basename "$file")
-              echo "| $filename | [Download]($filename) |" >> "$folder/README.md"
+              echo "| $filename | [Download]($filename) |" >> "$readme_path"
             done
+
+            echo "" >> "$readme_path"
+            echo "---" >> "$readme_path"
+            echo "_Auto-generated by GitHub Actions_" >> "$readme_path"
           done
 
-      - name: Summary
+          echo "README.md files created for all folders"
+
+      - name: Display download summary
         run: |
           echo "=== Download Summary ==="
-          du -sh downloads/ 2>/dev/null || echo "No files"
-          echo "Files: $(find downloads -type f ! -name 'README.md' | wc -l)"
+          echo "Total size:"
+          du -sh downloads/ 2>/dev/null || echo "No files downloaded yet"
+          echo ""
+          echo "Folder structure:"
+          find downloads -type d 2>/dev/null || echo "No folders yet"
+          echo ""
+          echo "Total files downloaded:"
+          find downloads -type f 2>/dev/null | wc -l
+          echo ""
+          echo "If not all files were downloaded (rate limited),"
+          echo "run this workflow again to continue downloading."
 
-      - name: Commit and push
+      - name: Commit and push files to repository
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
+
           git add --force downloads/
-          if ! git diff --staged --quiet; then
+
+          if git diff --staged --quiet; then
+            echo "No new files to commit"
+          else
             FILE_COUNT=$(find downloads -type f ! -name "README.md" | wc -l)
-            git commit -m "Downloaded $FILE_COUNT files from Google Drive"
+            FOLDER_COUNT=$(find downloads -mindepth 1 -type d | wc -l)
+
+            git commit -m "📥 Downloaded $FILE_COUNT files in $FOLDER_COUNT folders from Google Drive"
             git push
+
+            echo ""
+            echo "=============================================="
+            echo "Successfully committed $FILE_COUNT files!"
+            echo "=============================================="
           fi
