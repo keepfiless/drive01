@@ -26,7 +26,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install gdown
+        run: pip install gdown requests
 
       - name: Extract folder ID from URL
         id: extract_id
@@ -52,9 +52,11 @@ jobs:
           cat << 'PYTHON_SCRIPT' > download_script.py
           import os
           import sys
+          import re
+          import json
+          import requests
           from pathlib import Path
           import gdown
-          from gdown.download_folder import download_folder
 
           def get_existing_files(download_dir):
               """Get set of all existing file paths in download directory."""
@@ -66,6 +68,144 @@ jobs:
                           rel_path = file_path.relative_to(download_path)
                           existing.add(str(rel_path))
               return existing
+
+          def get_folder_contents(folder_id, session):
+              """Get list of files and folders from a Google Drive folder."""
+              url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+              try:
+                  headers = {
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                  }
+                  res = session.get(url, headers=headers)
+
+                  if res.status_code != 200:
+                      print(f"Failed to access folder: {folder_id} (status: {res.status_code})")
+                      return []
+
+                  contents = []
+
+                  # Pattern to find files/folders in the page
+                  # Looking for patterns like: ["FILE_ID","FILE_NAME",...]
+                  # The data is in a specific format in the page
+
+                  # Try to find the data array in the page
+                  text = res.text
+
+                  # Find all potential file/folder entries
+                  # Pattern: data-id="ID" followed by name info
+                  id_pattern = r'data-id="([a-zA-Z0-9_-]{20,})"'
+                  ids = re.findall(id_pattern, text)
+
+                  # Also look for the JSON-like structures
+                  # Pattern for file entries in Google Drive HTML
+                  json_pattern = r'\["([a-zA-Z0-9_-]{25,})","([^"]+)",[^,]*,[^,]*,"([^"]*)"'
+                  matches = re.findall(json_pattern, text)
+
+                  seen_ids = set()
+
+                  for match in matches:
+                      file_id, name, mime_type = match[0], match[1], match[2] if len(match) > 2 else ""
+
+                      if file_id in seen_ids:
+                          continue
+                      seen_ids.add(file_id)
+
+                      # Skip if it's the folder itself
+                      if file_id == folder_id:
+                          continue
+
+                      is_folder = 'folder' in mime_type.lower() if mime_type else False
+
+                      contents.append({
+                          'id': file_id,
+                          'name': name,
+                          'is_folder': is_folder
+                      })
+
+                  # If no matches found with first pattern, try alternative
+                  if not contents:
+                      # Alternative: look for specific patterns
+                      alt_pattern = r'\["(1[a-zA-Z0-9_-]{30,})","([^"]+)","https://drive\.google\.com/[^"]*"'
+                      alt_matches = re.findall(alt_pattern, text)
+
+                      for match in alt_matches:
+                          file_id, name = match[0], match[1]
+                          if file_id not in seen_ids:
+                              seen_ids.add(file_id)
+                              contents.append({
+                                  'id': file_id,
+                                  'name': name,
+                                  'is_folder': False  # Assume file
+                              })
+
+                  return contents
+
+              except Exception as e:
+                  print(f"Error getting folder contents: {e}")
+                  return []
+
+          def download_recursive(folder_id, local_dir, existing_set, session, stats):
+              """Recursively download folder, skipping existing files."""
+
+              contents = get_folder_contents(folder_id, session)
+
+              if not contents:
+                  print(f"  No contents found or cannot access folder")
+                  return
+
+              for item in contents:
+                  item_id = item['id']
+                  item_name = item['name']
+                  is_folder = item['is_folder']
+
+                  # Clean filename
+                  safe_name = "".join(c for c in item_name if c not in '<>:"/\\|?*')
+                  local_path = os.path.join(local_dir, safe_name)
+                  rel_path = os.path.relpath(local_path, 'downloads')
+
+                  if is_folder:
+                      print(f"  [FOLDER] {safe_name}")
+                      os.makedirs(local_path, exist_ok=True)
+                      download_recursive(item_id, local_path, existing_set, session, stats)
+                  else:
+                      # Check if file exists
+                      if rel_path in existing_set:
+                          print(f"  [SKIP] {rel_path}")
+                          stats['skipped'] += 1
+                      elif os.path.exists(local_path):
+                          print(f"  [SKIP] {rel_path} (exists on disk)")
+                          stats['skipped'] += 1
+                      else:
+                          print(f"  [DOWNLOAD] {rel_path}")
+                          os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                          try:
+                              gdown.download(
+                                  id=item_id,
+                                  output=local_path,
+                                  quiet=False,
+                                  fuzzy=True
+                              )
+                              if os.path.exists(local_path):
+                                  stats['downloaded'] += 1
+                              else:
+                                  print(f"  [FAILED] {rel_path} - file not created")
+                                  stats['failed'] += 1
+                          except Exception as e:
+                              error_msg = str(e)
+                              print(f"  [FAILED] {rel_path}")
+                              print(f"           Error: {error_msg}")
+                              stats['failed'] += 1
+
+                              # Check if rate limited
+                              if 'quota' in error_msg.lower() or 'too many' in error_msg.lower() or 'Cannot retrieve' in error_msg:
+                                  print("")
+                                  print("=" * 50)
+                                  print("RATE LIMITED - Stopping download")
+                                  print("Run workflow again to continue")
+                                  print("=" * 50)
+                                  stats['rate_limited'] = True
+                                  return
 
           def main():
               folder_id = os.environ.get('FOLDER_ID')
@@ -80,129 +220,63 @@ jobs:
               existing_before = get_existing_files(download_dir)
               count_before = len(existing_before)
               print(f"Existing files in repo: {count_before}")
-              print()
 
               if count_before > 0:
-                  print("Files already downloaded:")
-                  for f in sorted(existing_before)[:20]:
-                      print(f"  ✓ {f}")
-                  if count_before > 20:
-                      print(f"  ... and {count_before - 20} more")
-                  print()
+                  print("Sample of existing files:")
+                  for f in sorted(existing_before)[:10]:
+                      print(f"  > {f}")
+                  if count_before > 10:
+                      print(f"  ... and {count_before - 10} more")
+              print()
 
-              print(f"Starting download from folder: {folder_id}")
+              print(f"Folder ID: {folder_id}")
               print("Files that already exist will be SKIPPED.")
               print()
 
-              # Use gdown with skip_download for existing files
-              url = f"https://drive.google.com/drive/folders/{folder_id}"
+              # Create session
+              session = requests.Session()
 
-              try:
-                  # Download folder - gdown handles the structure
-                  # We use remaining_ok=True to not fail on partial downloads
-                  download_folder(
-                      url=url,
-                      output=download_dir,
-                      quiet=False,
-                      remaining_ok=True,
-                      skip_download=existing_before  # Pass existing files to skip
-                  )
-              except TypeError:
-                  # Older gdown version without skip_download parameter
-                  # Fall back to manual approach
-                  print("Using fallback download method...")
+              # Stats tracking
+              stats = {
+                  'downloaded': 0,
+                  'skipped': 0,
+                  'failed': 0,
+                  'rate_limited': False
+              }
 
-                  # Import internal functions
-                  from gdown.download_folder import _get_session, parse_folder_page
-
-                  session = _get_session(proxy=None, use_cookies=False)
-
-                  def download_recursive(fid, local_dir, existing_set):
-                      """Recursively download folder, skipping existing files."""
-                      folder_url = f"https://drive.google.com/drive/folders/{fid}"
-
-                      try:
-                          res = session.get(folder_url)
-                          if res.status_code != 200:
-                              print(f"Cannot access folder: {fid}")
-                              return 0, 0
-
-                          # Parse folder contents
-                          contents = parse_folder_page(folder_url, session)
-
-                          downloaded = 0
-                          skipped = 0
-
-                          for item in contents:
-                              item_name = item.name
-                              item_id = item.id
-                              item_type = item.type
-
-                              local_path = os.path.join(local_dir, item_name)
-                              rel_path = os.path.relpath(local_path, 'downloads')
-
-                              if item_type == "folder":
-                                  os.makedirs(local_path, exist_ok=True)
-                                  d, s = download_recursive(item_id, local_path, existing_set)
-                                  downloaded += d
-                                  skipped += s
-                              else:
-                                  # Check if file exists
-                                  if rel_path in existing_set or os.path.exists(local_path):
-                                      print(f"SKIP (exists): {rel_path}")
-                                      skipped += 1
-                                  else:
-                                      print(f"DOWNLOAD: {rel_path}")
-                                      os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                                      try:
-                                          gdown.download(
-                                              id=item_id,
-                                              output=local_path,
-                                              quiet=False
-                                          )
-                                          downloaded += 1
-                                      except Exception as e:
-                                          print(f"FAILED: {rel_path} - {e}")
-                                          print("Rate limited. Run workflow again to continue.")
-                                          return downloaded, skipped
-
-                          return downloaded, skipped
-
-                      except Exception as e:
-                          print(f"Error: {e}")
-                          return 0, 0
-
-                  downloaded, skipped = download_recursive(folder_id, download_dir, existing_before)
-                  print()
-                  print(f"Downloaded: {downloaded}, Skipped: {skipped}")
-
-              except Exception as e:
-                  print(f"Download stopped: {e}")
-                  print("This is likely due to Google Drive rate limiting.")
-                  print("Run the workflow again to continue downloading.")
+              # Start download
+              print("Scanning folder structure...")
+              os.makedirs(download_dir, exist_ok=True)
+              download_recursive(folder_id, download_dir, existing_before, session, stats)
 
               # Count files AFTER download
               existing_after = get_existing_files(download_dir)
               count_after = len(existing_after)
-              new_files = count_after - count_before
 
               print()
               print("=" * 60)
               print("DOWNLOAD SUMMARY")
               print("=" * 60)
-              print(f"Files before: {count_before}")
-              print(f"Files after:  {count_after}")
-              print(f"New files:    {new_files}")
+              print(f"Files before run:  {count_before}")
+              print(f"Files after run:   {count_after}")
+              print(f"New files:         {count_after - count_before}")
+              print()
+              print(f"Downloaded: {stats['downloaded']}")
+              print(f"Skipped:    {stats['skipped']}")
+              print(f"Failed:     {stats['failed']}")
               print()
 
-              if new_files > 0:
-                  print("✓ New files downloaded successfully!")
+              if stats['rate_limited']:
+                  print("Download was RATE LIMITED.")
+                  print("Run this workflow again to continue.")
+              elif stats['downloaded'] == 0 and stats['failed'] == 0:
+                  print("No new files to download.")
+                  if count_after > 0:
+                      print(f"All {count_after} files are already in the repository!")
+                      print("100% COMPLETE")
               else:
-                  print("No new files downloaded.")
-                  print("Either all files exist or rate limiting occurred.")
+                  print("Run workflow again if more files remain.")
 
-              print()
-              print("Run this workflow again with the same URL to continue.")
               print("=" * 60)
 
           if __name__ == "__main__":
@@ -264,12 +338,12 @@ jobs:
             FILE_COUNT=$(find downloads -type f ! -name "README.md" | wc -l)
             FOLDER_COUNT=$(find downloads -mindepth 1 -type d | wc -l)
 
-            git commit -m "📥 Update: $FILE_COUNT files in $FOLDER_COUNT folders"
+            git commit -m "Update: $FILE_COUNT files in $FOLDER_COUNT folders"
             git push
 
             echo ""
             echo "=============================================="
-            echo "✓ SAVED $FILE_COUNT FILES TO REPOSITORY"
+            echo "SAVED $FILE_COUNT FILES TO REPOSITORY"
             echo "=============================================="
             echo ""
             echo "If more files remain, run workflow again."
