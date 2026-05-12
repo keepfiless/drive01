@@ -1,4 +1,4 @@
-name: 06 - Download Google Drive Files
+name: 07 - Download Google Drive Files
 
 on:
   workflow_dispatch:
