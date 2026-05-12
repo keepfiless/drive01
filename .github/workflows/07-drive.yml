@@ -64,142 +64,69 @@ jobs:
           import os
           import json
           import time
+
+          # Use gdown's own internal machinery — the same code path that
+          # makes "gdown --folder" work on public shared folders.
           import gdown
+          from gdown.download_folder import download_and_parse_google_drive_link
 
-          def list_folder_recursive(folder_id, path_prefix="", depth=0):
+          def walk_gdrive_tree(gdrive_file, path_prefix="", depth=0):
+              """Recursively walk a GDriveFile tree returned by gdown and
+              collect every non-folder leaf as {id, name, path}."""
               indent = "  " * depth
-              print(f"{indent}Listing folder: {folder_id} (path: {path_prefix or '/'})")
-
               all_files = []
 
-              for attempt in range(3):
-                  try:
-                      # gdown.download_folder with skip_download=True lists without downloading
-                      files = gdown.download_folder(
-                          id=folder_id,
-                          output="/tmp/gdown_probe",
-                          skip_download=True,
-                          quiet=False,
-                          use_cookies=False,
-                      )
-                      break
-                  except Exception as e:
-                      print(f"{indent}  Attempt {attempt+1} failed: {e}")
-                      if attempt < 2:
-                          time.sleep(5)
-                      files = []
+              children = getattr(gdrive_file, "children", None) or []
+              if not children:
+                  # Leaf file (no children attribute means it's a file)
+                  name = gdrive_file.name
+                  file_path = os.path.join(path_prefix, name) if path_prefix else name
+                  print(f"{indent}  [FILE] {name}")
+                  return [{"id": gdrive_file.id, "name": name, "path": file_path}]
 
-              # gdown returns a list of local paths it *would* write.
-              # We need IDs and names — use gdown's internal retrieve function instead.
-              return all_files
+              files   = [c for c in children if not getattr(c, "is_folder", False)]
+              folders = [c for c in children if getattr(c, "is_folder", False)]
 
-          # --------------------------------------------------------------------------
-          # Better approach: use gdown's internal API helper directly to get file list
-          # --------------------------------------------------------------------------
-          import re
-          import requests
-
-          def gdrive_folder_contents(folder_id, session):
-              """
-              Uses the same internal Drive v3-like endpoint that gdown uses.
-              Returns list of dicts: {id, name, mimeType}
-              """
-              url = "https://drive.google.com/drive/folders/" + folder_id
-              # First, get the page to extract the key/metadata
-              # gdown uses this endpoint to list folder contents:
-              api_url = (
-                  "https://drive.google.com/drive/folders/" + folder_id
-              )
-
-              # Use gdown's retrieve_json which calls the internal 'drive' endpoint
-              # Replicate what gdown does: fetch _getFolderContents endpoint
-              contents_url = (
-                  "https://clients6.google.com/drive/v2beta/files"
-                  f"?openDrive=false&reason=102&syncType=0&errorRecovery=false"
-                  f"&q=trashed%3Dfalse+and+%27{folder_id}%27+in+parents"
-                  f"&fields=kind,nextPageToken,items(kind,fileSize,mimeType,teamDriveId,"
-                  f"id,title,labels(trashed),alternateLink)"
-                  f"&appDataFilter=NO_APP_DATA&spaces=drive&maxResults=1000"
-                  f"&orderBy=folder,title&retries=0&includeItemsFromAllDrives=true"
-                  f"&supportsAllDrives=true&pageToken="
-              )
-
-              items = []
-              page_token = ""
-              while True:
-                  paged_url = contents_url + page_token
-                  resp = session.get(paged_url, timeout=30)
-                  if resp.status_code != 200:
-                      print(f"  API returned {resp.status_code}")
-                      break
-                  try:
-                      data = resp.json()
-                  except Exception:
-                      print("  Failed to parse JSON response")
-                      break
-                  items.extend(data.get("items", []))
-                  page_token = data.get("nextPageToken", "")
-                  if not page_token:
-                      break
-                  time.sleep(0.5)
-              return items
-
-          def list_folder_recursive_v2(folder_id, path_prefix="", session=None, depth=0):
-              if session is None:
-                  session = requests.Session()
-                  session.headers.update({
-                      "User-Agent": (
-                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/124.0.0.0 Safari/537.36"
-                      )
-                  })
-
-              indent = "  " * depth
-              print(f"{indent}Listing: {folder_id} (path: {path_prefix or '/'})")
-
-              all_files = []
-              for attempt in range(3):
-                  try:
-                      items = gdrive_folder_contents(folder_id, session)
-                      break
-                  except Exception as e:
-                      print(f"{indent}  Attempt {attempt+1} failed: {e}")
-                      if attempt < 2:
-                          time.sleep(5)
-                      items = []
-
-              FOLDER_MIME = "application/vnd.google-apps.folder"
-              files = [i for i in items if i.get("mimeType") != FOLDER_MIME]
-              folders = [i for i in items if i.get("mimeType") == FOLDER_MIME]
-
-              print(f"{indent}  Found {len(files)} files, {len(folders)} subfolders")
+              print(f"{indent}Folder '{gdrive_file.name}': "
+                    f"{len(files)} files, {len(folders)} sub-folders")
 
               for f in files:
-                  name = f.get("title", f["id"])
+                  name = f.name
                   file_path = os.path.join(path_prefix, name) if path_prefix else name
-                  print(f"{indent}    [FILE] {name}")
-                  all_files.append({"id": f["id"], "name": name, "path": file_path})
+                  print(f"{indent}  [FILE] {name}")
+                  all_files.append({"id": f.id, "name": name, "path": file_path})
 
               for folder in folders:
-                  name = folder.get("title", folder["id"])
-                  subfolder_path = os.path.join(path_prefix, name) if path_prefix else name
-                  print(f"{indent}    [FOLDER] {name}")
-                  time.sleep(1)
-                  sub_files = list_folder_recursive_v2(
-                      folder["id"], subfolder_path, session, depth + 1
-                  )
+                  name = folder.name
+                  sub_path = os.path.join(path_prefix, name) if path_prefix else name
+                  print(f"{indent}  [FOLDER] {name}")
+                  sub_files = walk_gdrive_tree(folder, sub_path, depth + 1)
                   all_files.extend(sub_files)
 
               return all_files
 
-          # ── Main ──────────────────────────────────────────────────────────────────
           folder_id = os.environ["FOLDER_ID"]
+          url = f"https://drive.google.com/drive/folders/{folder_id}"
+
           print("=" * 60)
           print(f"Listing folder: {folder_id}")
           print("=" * 60)
 
-          all_files = list_folder_recursive_v2(folder_id)
+          all_files = []
+          for attempt in range(3):
+              try:
+                  return_code, gdrive_file = download_and_parse_google_drive_link(
+                      url,
+                      quiet=False,
+                      use_cookies=False,
+                      remaining_ok=True,
+                  )
+                  all_files = walk_gdrive_tree(gdrive_file)
+                  break
+              except Exception as e:
+                  print(f"Attempt {attempt + 1} failed: {e}")
+                  if attempt < 2:
+                      time.sleep(10)
 
           # Deduplicate by ID
           seen = set()
