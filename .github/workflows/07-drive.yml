@@ -39,7 +39,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install gdown
 
       - name: Extract folder ID from URL
         id: extract_id
@@ -63,101 +63,167 @@ jobs:
           python3 << 'EOF'
           import os
           import json
-          import re
-          import requests
           import time
+          import gdown
 
-          def get_folder_contents(folder_id, session):
-              url = f"https://drive.google.com/drive/folders/{folder_id}"
+          def list_folder_recursive(folder_id, path_prefix="", depth=0):
+              indent = "  " * depth
+              print(f"{indent}Listing folder: {folder_id} (path: {path_prefix or '/'})")
+
+              all_files = []
+
               for attempt in range(3):
                   try:
-                      resp = session.get(url, timeout=30)
-                      if resp.status_code != 200:
-                          print(f"  Got status {resp.status_code}, retrying...")
-                          time.sleep(3)
-                          continue
-                      content = resp.text
-                      files = []
-                      folders = []
-                      pattern = r'\["([a-zA-Z0-9_-]{20,50})"\s*,\s*\["[a-zA-Z0-9_-]+"\]\s*,\s*"([^"]{1,500})"'
-                      matches = re.findall(pattern, content)
-                      folder_ids = set()
-                      fp1 = r'"application/vnd\.google-apps\.folder"[^"]{0,200}"([a-zA-Z0-9_-]{20,50})"'
-                      fp2 = r'"([a-zA-Z0-9_-]{20,50})"[^"]{0,200}"application/vnd\.google-apps\.folder"'
-                      folder_ids.update(re.findall(fp1, content))
-                      folder_ids.update(re.findall(fp2, content))
-                      seen = set()
-                      for item_id, item_name in matches:
-                          if item_id in seen or item_id == folder_id:
-                              continue
-                          if len(item_id) < 20 or len(item_id) > 50:
-                              continue
-                          if re.match(r'^[a-zA-Z0-9_-]{20,}$', item_name):
-                              continue
-                          if item_name.startswith('[') or item_name.startswith('{'):
-                              continue
-                          seen.add(item_id)
-                          if item_id in folder_ids:
-                              folders.append({'id': item_id, 'name': item_name})
-                          elif '.' in item_name.split('/')[-1]:
-                              files.append({'id': item_id, 'name': item_name})
-                          else:
-                              if item_id in folder_ids:
-                                  folders.append({'id': item_id, 'name': item_name})
-                              else:
-                                  files.append({'id': item_id, 'name': item_name})
-                      return files, folders
+                      # gdown.download_folder with skip_download=True lists without downloading
+                      files = gdown.download_folder(
+                          id=folder_id,
+                          output="/tmp/gdown_probe",
+                          skip_download=True,
+                          quiet=False,
+                          use_cookies=False,
+                      )
+                      break
                   except Exception as e:
-                      print(f"  Attempt {attempt+1} failed: {e}")
-                      time.sleep(3)
-              return [], []
+                      print(f"{indent}  Attempt {attempt+1} failed: {e}")
+                      if attempt < 2:
+                          time.sleep(5)
+                      files = []
 
-          def list_folder_recursive(folder_id, path_prefix="", session=None, depth=0):
+              # gdown returns a list of local paths it *would* write.
+              # We need IDs and names — use gdown's internal retrieve function instead.
+              return all_files
+
+          # --------------------------------------------------------------------------
+          # Better approach: use gdown's internal API helper directly to get file list
+          # --------------------------------------------------------------------------
+          import re
+          import requests
+
+          def gdrive_folder_contents(folder_id, session):
+              """
+              Uses the same internal Drive v3-like endpoint that gdown uses.
+              Returns list of dicts: {id, name, mimeType}
+              """
+              url = "https://drive.google.com/drive/folders/" + folder_id
+              # First, get the page to extract the key/metadata
+              # gdown uses this endpoint to list folder contents:
+              api_url = (
+                  "https://drive.google.com/drive/folders/" + folder_id
+              )
+
+              # Use gdown's retrieve_json which calls the internal 'drive' endpoint
+              # Replicate what gdown does: fetch _getFolderContents endpoint
+              contents_url = (
+                  "https://clients6.google.com/drive/v2beta/files"
+                  f"?openDrive=false&reason=102&syncType=0&errorRecovery=false"
+                  f"&q=trashed%3Dfalse+and+%27{folder_id}%27+in+parents"
+                  f"&fields=kind,nextPageToken,items(kind,fileSize,mimeType,teamDriveId,"
+                  f"id,title,labels(trashed),alternateLink)"
+                  f"&appDataFilter=NO_APP_DATA&spaces=drive&maxResults=1000"
+                  f"&orderBy=folder,title&retries=0&includeItemsFromAllDrives=true"
+                  f"&supportsAllDrives=true&pageToken="
+              )
+
+              items = []
+              page_token = ""
+              while True:
+                  paged_url = contents_url + page_token
+                  resp = session.get(paged_url, timeout=30)
+                  if resp.status_code != 200:
+                      print(f"  API returned {resp.status_code}")
+                      break
+                  try:
+                      data = resp.json()
+                  except Exception:
+                      print("  Failed to parse JSON response")
+                      break
+                  items.extend(data.get("items", []))
+                  page_token = data.get("nextPageToken", "")
+                  if not page_token:
+                      break
+                  time.sleep(0.5)
+              return items
+
+          def list_folder_recursive_v2(folder_id, path_prefix="", session=None, depth=0):
               if session is None:
                   session = requests.Session()
                   session.headers.update({
-                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                      "User-Agent": (
+                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36"
+                      )
                   })
-              all_files = []
+
               indent = "  " * depth
               print(f"{indent}Listing: {folder_id} (path: {path_prefix or '/'})")
-              files, folders = get_folder_contents(folder_id, session)
-              print(f"{indent}  Found {len(files)} files, {len(folders)} folders")
+
+              all_files = []
+              for attempt in range(3):
+                  try:
+                      items = gdrive_folder_contents(folder_id, session)
+                      break
+                  except Exception as e:
+                      print(f"{indent}  Attempt {attempt+1} failed: {e}")
+                      if attempt < 2:
+                          time.sleep(5)
+                      items = []
+
+              FOLDER_MIME = "application/vnd.google-apps.folder"
+              files = [i for i in items if i.get("mimeType") != FOLDER_MIME]
+              folders = [i for i in items if i.get("mimeType") == FOLDER_MIME]
+
+              print(f"{indent}  Found {len(files)} files, {len(folders)} subfolders")
+
               for f in files:
-                  file_path = os.path.join(path_prefix, f['name']) if path_prefix else f['name']
-                  print(f"{indent}  [FILE] {f['name']}")
-                  all_files.append({'id': f['id'], 'name': f['name'], 'path': file_path})
+                  name = f.get("title", f["id"])
+                  file_path = os.path.join(path_prefix, name) if path_prefix else name
+                  print(f"{indent}    [FILE] {name}")
+                  all_files.append({"id": f["id"], "name": name, "path": file_path})
+
               for folder in folders:
-                  subfolder_path = os.path.join(path_prefix, folder['name']) if path_prefix else folder['name']
-                  print(f"{indent}  [FOLDER] {folder['name']}")
+                  name = folder.get("title", folder["id"])
+                  subfolder_path = os.path.join(path_prefix, name) if path_prefix else name
+                  print(f"{indent}    [FOLDER] {name}")
                   time.sleep(1)
-                  subfolder_files = list_folder_recursive(folder['id'], subfolder_path, session, depth + 1)
-                  all_files.extend(subfolder_files)
+                  sub_files = list_folder_recursive_v2(
+                      folder["id"], subfolder_path, session, depth + 1
+                  )
+                  all_files.extend(sub_files)
+
               return all_files
 
-          folder_id = os.environ.get('FOLDER_ID')
+          # ── Main ──────────────────────────────────────────────────────────────────
+          folder_id = os.environ["FOLDER_ID"]
           print("=" * 60)
           print(f"Listing folder: {folder_id}")
           print("=" * 60)
-          all_files = list_folder_recursive(folder_id)
+
+          all_files = list_folder_recursive_v2(folder_id)
+
+          # Deduplicate by ID
           seen = set()
           unique_files = []
           for f in all_files:
-              if f['id'] not in seen:
-                  seen.add(f['id'])
+              if f["id"] not in seen:
+                  seen.add(f["id"])
                   unique_files.append(f)
           all_files = unique_files
-          os.makedirs('file_list', exist_ok=True)
-          with open('file_list/all_files.json', 'w') as f:
-              json.dump(all_files, f, indent=2)
-          with open('file_list/summary.json', 'w') as f:
-              json.dump({'total_files': len(all_files), 'folder_id': folder_id}, f, indent=2)
-          print(f"\nTotal files: {len(all_files)}")
+
+          os.makedirs("file_list", exist_ok=True)
+          with open("file_list/all_files.json", "w") as fh:
+              json.dump(all_files, fh, indent=2)
+          with open("file_list/summary.json", "w") as fh:
+              json.dump({"total_files": len(all_files), "folder_id": folder_id}, fh, indent=2)
+
+          print(f"\nTotal files found: {len(all_files)}")
           if all_files:
               print("\nFirst 20 files:")
               for f in all_files[:20]:
                   print(f"  - {f['path']}")
-          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as fh:
+
+          github_output = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(github_output, "a") as fh:
               fh.write(f"total_files={len(all_files)}\n")
           EOF
 
@@ -174,7 +240,12 @@ jobs:
           cat file_list/summary.json
           echo ""
           echo "First 20 files:"
-          python3 -c "import json; files=json.load(open('file_list/all_files.json')); [print(f['path']) for f in files[:20]]" 2>/dev/null || echo "No files"
+          python3 -c "
+          import json
+          files = json.load(open('file_list/all_files.json'))
+          for f in files[:20]:
+              print(f['path'])
+          " 2>/dev/null || echo "No files found"
 
   download_files:
     needs: list_files
@@ -238,19 +309,28 @@ jobs:
 
           batch_size = int(os.environ.get('BATCH_SIZE', 25))
           delay = int(os.environ.get('DELAY_BETWEEN_FILES', 2))
+
           with open('file_list/all_files.json', 'r') as f:
               all_files = json.load(f)
+
           if not all_files:
               print("No files to download!")
               exit(0)
+
+          # Collect already-downloaded paths to allow resuming
           downloaded = set()
           for root, dirs, files in os.walk('downloads'):
               for f in files:
                   if f not in ['README.md', '.gitkeep']:
                       downloaded.add(f)
                       downloaded.add(os.path.relpath(os.path.join(root, f), 'downloads'))
-          to_download = [f for f in all_files if f['path'] not in downloaded and f['name'] not in downloaded]
-          print(f"Total: {len(all_files)}, Already downloaded: {len(downloaded)}, To download: {len(to_download)}")
+
+          to_download = [
+              f for f in all_files
+              if f['path'] not in downloaded and f['name'] not in downloaded
+          ]
+          print(f"Total: {len(all_files)}, Already downloaded: {len(all_files) - len(to_download)}, To download: {len(to_download)}")
+
           success = 0
           failed = []
           for i, f in enumerate(to_download):
@@ -265,11 +345,15 @@ jobs:
               if (i + 1) % batch_size == 0 and i < len(to_download) - 1:
                   print(f"\nBatch complete. Waiting 30s...")
                   time.sleep(30)
+
           print(f"\n{'='*60}")
           print(f"Downloaded: {success}, Failed: {len(failed)}")
           if failed:
               with open('file_list/failed.json', 'w') as f:
                   json.dump(failed, f, indent=2)
+              print("Failed files:")
+              for f in failed:
+                  print(f"  - {f['path']}")
           EOF
 
       - name: Generate README files
