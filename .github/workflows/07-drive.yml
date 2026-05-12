@@ -1,4 +1,4 @@
-name: 07 - Download Google Drive Files
+name: 06 - Download Google Drive Files
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install gdown
+      - name: Install dependencies
         run: pip install gdown
 
       - name: Extract folder ID from URL
@@ -45,38 +45,185 @@ jobs:
       - name: Create downloads directory
         run: mkdir -p downloads
 
-      - name: Download files from Google Drive
+      - name: Download files with skip existing
         env:
           FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
         run: |
-          echo "==============================================="
-          echo "Downloading from Google Drive folder: $FOLDER_ID"
-          echo "==============================================="
-          echo ""
-          echo "NOTE: This workflow will download new files from the Google Drive folder."
-          echo "Already downloaded files will be skipped by gdown."
-          echo "If the download is interrupted by Google Drive rate limiting,"
-          echo "simply run the workflow again to resume downloading."
-          echo ""
+          cat << 'PYTHON_SCRIPT' > download_script.py
+          import os
+          import sys
+          from pathlib import Path
+          import gdown
+          from gdown.download_folder import download_folder
 
-          cd downloads
-          # Using --remaining ensures gdown only downloads files that do not already exist.
-          # We use `|| true` so the workflow doesn't fail if gdown can't download all files due to rate limiting.
-          # The next run of the workflow will pick up where this one left off.
-          gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" --remaining || true
-          cd ..
+          def get_existing_files(download_dir):
+              """Get set of all existing file paths in download directory."""
+              existing = set()
+              download_path = Path(download_dir)
+              if download_path.exists():
+                  for file_path in download_path.rglob('*'):
+                      if file_path.is_file() and file_path.name != 'README.md':
+                          rel_path = file_path.relative_to(download_path)
+                          existing.add(str(rel_path))
+              return existing
 
+          def main():
+              folder_id = os.environ.get('FOLDER_ID')
+              download_dir = 'downloads'
+
+              print("=" * 60)
+              print("GOOGLE DRIVE DOWNLOADER - RESUME MODE")
+              print("=" * 60)
+              print()
+
+              # Count existing files BEFORE download
+              existing_before = get_existing_files(download_dir)
+              count_before = len(existing_before)
+              print(f"Existing files in repo: {count_before}")
+              print()
+
+              if count_before > 0:
+                  print("Files already downloaded:")
+                  for f in sorted(existing_before)[:20]:
+                      print(f"  ✓ {f}")
+                  if count_before > 20:
+                      print(f"  ... and {count_before - 20} more")
+                  print()
+
+              print(f"Starting download from folder: {folder_id}")
+              print("Files that already exist will be SKIPPED.")
+              print()
+
+              # Use gdown with skip_download for existing files
+              url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+              try:
+                  # Download folder - gdown handles the structure
+                  # We use remaining_ok=True to not fail on partial downloads
+                  download_folder(
+                      url=url,
+                      output=download_dir,
+                      quiet=False,
+                      remaining_ok=True,
+                      skip_download=existing_before  # Pass existing files to skip
+                  )
+              except TypeError:
+                  # Older gdown version without skip_download parameter
+                  # Fall back to manual approach
+                  print("Using fallback download method...")
+
+                  # Import internal functions
+                  from gdown.download_folder import _get_session, parse_folder_page
+
+                  session = _get_session(proxy=None, use_cookies=False)
+
+                  def download_recursive(fid, local_dir, existing_set):
+                      """Recursively download folder, skipping existing files."""
+                      folder_url = f"https://drive.google.com/drive/folders/{fid}"
+
+                      try:
+                          res = session.get(folder_url)
+                          if res.status_code != 200:
+                              print(f"Cannot access folder: {fid}")
+                              return 0, 0
+
+                          # Parse folder contents
+                          contents = parse_folder_page(folder_url, session)
+
+                          downloaded = 0
+                          skipped = 0
+
+                          for item in contents:
+                              item_name = item.name
+                              item_id = item.id
+                              item_type = item.type
+
+                              local_path = os.path.join(local_dir, item_name)
+                              rel_path = os.path.relpath(local_path, 'downloads')
+
+                              if item_type == "folder":
+                                  os.makedirs(local_path, exist_ok=True)
+                                  d, s = download_recursive(item_id, local_path, existing_set)
+                                  downloaded += d
+                                  skipped += s
+                              else:
+                                  # Check if file exists
+                                  if rel_path in existing_set or os.path.exists(local_path):
+                                      print(f"SKIP (exists): {rel_path}")
+                                      skipped += 1
+                                  else:
+                                      print(f"DOWNLOAD: {rel_path}")
+                                      os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                                      try:
+                                          gdown.download(
+                                              id=item_id,
+                                              output=local_path,
+                                              quiet=False
+                                          )
+                                          downloaded += 1
+                                      except Exception as e:
+                                          print(f"FAILED: {rel_path} - {e}")
+                                          print("Rate limited. Run workflow again to continue.")
+                                          return downloaded, skipped
+
+                          return downloaded, skipped
+
+                      except Exception as e:
+                          print(f"Error: {e}")
+                          return 0, 0
+
+                  downloaded, skipped = download_recursive(folder_id, download_dir, existing_before)
+                  print()
+                  print(f"Downloaded: {downloaded}, Skipped: {skipped}")
+
+              except Exception as e:
+                  print(f"Download stopped: {e}")
+                  print("This is likely due to Google Drive rate limiting.")
+                  print("Run the workflow again to continue downloading.")
+
+              # Count files AFTER download
+              existing_after = get_existing_files(download_dir)
+              count_after = len(existing_after)
+              new_files = count_after - count_before
+
+              print()
+              print("=" * 60)
+              print("DOWNLOAD SUMMARY")
+              print("=" * 60)
+              print(f"Files before: {count_before}")
+              print(f"Files after:  {count_after}")
+              print(f"New files:    {new_files}")
+              print()
+
+              if new_files > 0:
+                  print("✓ New files downloaded successfully!")
+              else:
+                  print("No new files downloaded.")
+                  print("Either all files exist or rate limiting occurred.")
+
+              print()
+              print("Run this workflow again with the same URL to continue.")
+              print("=" * 60)
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
+
+          python download_script.py
+
+      - name: Show file count
+        run: |
           echo ""
-          echo "Download attempt completed!"
-          echo "The workflow will now check for new files to commit."
+          echo "=== REPOSITORY STATUS ==="
+          FILE_COUNT=$(find downloads -type f ! -name "README.md" 2>/dev/null | wc -l)
+          echo "Total files in downloads folder: $FILE_COUNT"
+          echo ""
 
       - name: Generate README.md for each folder
         run: |
           find downloads -mindepth 1 -type d | while read -r folder; do
             folder_name=$(basename "$folder")
             readme_path="$folder/README.md"
-
-            echo "Creating README.md for: $folder_name"
 
             echo "# $folder_name" > "$readme_path"
             echo "" >> "$readme_path"
@@ -95,24 +242,7 @@ jobs:
             echo "_Auto-generated by GitHub Actions_" >> "$readme_path"
           done
 
-          echo "README.md files created for all folders"
-
-      - name: Display download summary
-        run: |
-          echo "=== Download Summary ==="
-          echo "Total size:"
-          du -sh downloads/ 2>/dev/null || echo "No files downloaded yet"
-          echo ""
-          echo "Folder structure:"
-          find downloads -type d 2>/dev/null || echo "No folders yet"
-          echo ""
-          echo "Total files downloaded:"
-          find downloads -type f 2>/dev/null | wc -l
-          echo ""
-          echo "If not all files were downloaded (rate limited),"
-          echo "run this workflow again to continue downloading."
-
-      - name: Commit and push files to repository
+      - name: Commit and push files
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -120,16 +250,30 @@ jobs:
           git add --force downloads/
 
           if git diff --staged --quiet; then
-            echo "No new files to commit"
+            echo ""
+            echo "=============================================="
+            echo "NO NEW FILES TO COMMIT"
+            echo "=============================================="
+            echo "All files are already in the repository."
+            FILE_COUNT=$(find downloads -type f ! -name "README.md" 2>/dev/null | wc -l)
+            echo "Total files: $FILE_COUNT"
+            echo ""
+            echo "If this matches your Google Drive folder count,"
+            echo "then 100% of files are downloaded!"
           else
             FILE_COUNT=$(find downloads -type f ! -name "README.md" | wc -l)
             FOLDER_COUNT=$(find downloads -mindepth 1 -type d | wc -l)
 
-            git commit -m "📥 Downloaded $FILE_COUNT files in $FOLDER_COUNT folders from Google Drive"
+            git commit -m "📥 Update: $FILE_COUNT files in $FOLDER_COUNT folders"
             git push
 
             echo ""
             echo "=============================================="
-            echo "Successfully committed $FILE_COUNT files!"
+            echo "✓ SAVED $FILE_COUNT FILES TO REPOSITORY"
             echo "=============================================="
+            echo ""
+            echo "If more files remain, run workflow again."
           fi
+
+      - name: Cleanup
+        run: rm -f download_script.py
