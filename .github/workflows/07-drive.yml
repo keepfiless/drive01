@@ -1,0 +1,544 @@
+name: 07 - Download Google Drive Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_folder_url:
+        description: 'Google Drive folder URL (public shared link)'
+        required: true
+        type: string
+      batch_size:
+        description: 'Number of files to download per batch (lower = safer, default: 25)'
+        required: false
+        default: '25'
+        type: string
+      delay_between_batches:
+        description: 'Delay in seconds between batches (default: 30)'
+        required: false
+        default: '30'
+        type: string
+      delay_between_files:
+        description: 'Delay in seconds between individual files (default: 2)'
+        required: false
+        default: '2'
+        type: string
+
+jobs:
+  # Job 1: List all files and folders
+  list_files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      folder_id: ${{ steps.extract_id.outputs.folder_id }}
+      total_files: ${{ steps.list.outputs.total_files }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install gdown requests
+
+      - name: Extract folder ID from URL
+        id: extract_id
+        run: |
+          URL="${{ github.event.inputs.drive_folder_url }}"
+          if [[ "$URL" =~ folders/([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          elif [[ "$URL" =~ id=([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          else
+            FOLDER_ID="$URL"
+          fi
+          echo "folder_id=$FOLDER_ID" >> $GITHUB_OUTPUT
+          echo "Extracted folder ID: $FOLDER_ID"
+
+      - name: List all files recursively
+        id: list
+        env:
+          FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
+        run: |
+          cat << 'PYTHON_SCRIPT' > list_files.py
+          import os
+          import json
+          import time
+          import requests
+          from urllib.parse import urlencode
+
+          def get_folder_contents(folder_id, retries=3, delay=5):
+              """Get contents of a Google Drive folder using the embed page parser."""
+              files = []
+              folders = []
+
+              for attempt in range(retries):
+                  try:
+                      # Use gdown's internal method to list folder contents
+                      import gdown
+                      from gdown.download_folder import _get_session, _get_folder_list
+
+                      sess = _get_session()
+                      url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+                      try:
+                          folder_list = _get_folder_list(sess, url)
+                          for item in folder_list:
+                              if item[0] == 'folder':
+                                  folders.append({
+                                      'id': item[1],
+                                      'name': item[2],
+                                      'type': 'folder'
+                                  })
+                              else:
+                                  files.append({
+                                      'id': item[1],
+                                      'name': item[2],
+                                      'type': 'file'
+                                  })
+                          return files, folders
+                      except Exception as e:
+                          print(f"gdown method failed: {e}, trying alternative...")
+
+                      # Alternative: parse the folder page directly
+                      response = sess.get(url)
+                      if response.status_code == 200:
+                          import re
+                          # Look for file/folder data in the page
+                          # This is a simplified parser
+                          return files, folders
+
+                  except Exception as e:
+                      print(f"Attempt {attempt + 1} failed: {e}")
+                      if attempt < retries - 1:
+                          time.sleep(delay * (attempt + 1))
+
+              return files, folders
+
+          def list_all_files(folder_id, base_path=""):
+              """Recursively list all files in a folder."""
+              all_files = []
+
+              print(f"Scanning folder: {folder_id} (path: {base_path or '/'})")
+
+              files, folders = get_folder_contents(folder_id)
+
+              # Add files with their paths
+              for f in files:
+                  f['path'] = os.path.join(base_path, f['name']) if base_path else f['name']
+                  f['parent_id'] = folder_id
+                  all_files.append(f)
+                  print(f"  Found file: {f['name']}")
+
+              # Recursively process subfolders
+              for folder in folders:
+                  folder_path = os.path.join(base_path, folder['name']) if base_path else folder['name']
+                  print(f"  Found folder: {folder['name']}")
+                  subfolder_files = list_all_files(folder['id'], folder_path)
+                  all_files.extend(subfolder_files)
+                  time.sleep(1)  # Small delay between folder requests
+
+              return all_files
+
+          def main():
+              folder_id = os.environ.get('FOLDER_ID')
+
+              print("=" * 60)
+              print(f"Starting file listing for folder: {folder_id}")
+              print("=" * 60)
+
+              # Use gdown's folder listing capability
+              import gdown
+              import tempfile
+
+              # Create a temp directory for gdown to work with
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  try:
+                      # Get folder info using gdown's internal functions
+                      url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+                      # Use gdown to get the file list without downloading
+                      from gdown.download_folder import _get_session, _get_folder_list, _parse_folder_page
+
+                      sess = _get_session()
+                      all_items = []
+                      folders_to_scan = [(folder_id, "")]
+
+                      while folders_to_scan:
+                          current_folder_id, current_path = folders_to_scan.pop(0)
+                          folder_url = f"https://drive.google.com/drive/folders/{current_folder_id}"
+
+                          print(f"\nScanning: {current_path or '/'} ({current_folder_id})")
+
+                          try:
+                              folder_list = _get_folder_list(sess, folder_url)
+
+                              for item in folder_list:
+                                  item_type, item_id, item_name = item[0], item[1], item[2]
+                                  item_path = os.path.join(current_path, item_name) if current_path else item_name
+
+                                  if item_type == 'folder':
+                                      folders_to_scan.append((item_id, item_path))
+                                      print(f"  [FOLDER] {item_name}")
+                                  else:
+                                      all_items.append({
+                                          'id': item_id,
+                                          'name': item_name,
+                                          'path': item_path,
+                                          'folder_id': current_folder_id,
+                                          'folder_path': current_path
+                                      })
+                                      print(f"  [FILE] {item_name}")
+
+                              # Delay between folder scans to avoid rate limiting
+                              time.sleep(2)
+
+                          except Exception as e:
+                              print(f"  Error scanning folder: {e}")
+                              # Add to retry list or skip
+                              continue
+
+                      # Save file list to JSON
+                      os.makedirs('file_list', exist_ok=True)
+
+                      # Save full list
+                      with open('file_list/all_files.json', 'w') as f:
+                          json.dump(all_items, f, indent=2)
+
+                      # Save summary
+                      summary = {
+                          'total_files': len(all_items),
+                          'root_folder_id': folder_id,
+                          'unique_folders': list(set(item['folder_path'] for item in all_items))
+                      }
+                      with open('file_list/summary.json', 'w') as f:
+                          json.dump(summary, f, indent=2)
+
+                      print("\n" + "=" * 60)
+                      print(f"Total files found: {len(all_items)}")
+                      print(f"Unique folders: {len(summary['unique_folders'])}")
+                      print("=" * 60)
+
+                      # Set output for GitHub Actions
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                          f.write(f"total_files={len(all_items)}\n")
+
+                  except Exception as e:
+                      print(f"Error: {e}")
+                      import traceback
+                      traceback.print_exc()
+
+                      # Create empty file list on error
+                      os.makedirs('file_list', exist_ok=True)
+                      with open('file_list/all_files.json', 'w') as f:
+                          json.dump([], f)
+                      with open('file_list/summary.json', 'w') as f:
+                          json.dump({'total_files': 0, 'error': str(e)}, f)
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
+
+          python list_files.py
+
+      - name: Upload file list as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: file-list
+          path: file_list/
+          retention-days: 1
+
+      - name: Display listing summary
+        run: |
+          echo "=== File Listing Summary ==="
+          if [ -f file_list/summary.json ]; then
+            cat file_list/summary.json | python -m json.tool
+          fi
+          echo ""
+          echo "File list saved as artifact for download job"
+
+  # Job 2: Download files in batches
+  download_files:
+    needs: list_files
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install gdown requests
+
+      - name: Download file list artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: file-list
+          path: file_list/
+
+      - name: Create downloads directory
+        run: mkdir -p downloads
+
+      - name: Check for existing downloads (resume support)
+        id: check_existing
+        run: |
+          # Count existing files
+          EXISTING_COUNT=$(find downloads -type f ! -name "README.md" ! -name ".gitkeep" 2>/dev/null | wc -l)
+          echo "existing_count=$EXISTING_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $EXISTING_COUNT existing files in downloads/"
+
+      - name: Download files in batches
+        env:
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+          DELAY_BETWEEN_BATCHES: ${{ github.event.inputs.delay_between_batches }}
+          DELAY_BETWEEN_FILES: ${{ github.event.inputs.delay_between_files }}
+          FOLDER_ID: ${{ needs.list_files.outputs.folder_id }}
+        run: |
+          cat << 'PYTHON_SCRIPT' > download_files.py
+          import os
+          import json
+          import time
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          def download_file_with_retry(file_id, file_name, output_path, max_retries=3):
+              """Download a single file with retry logic."""
+
+              # Create parent directory if needed
+              Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+              for attempt in range(max_retries):
+                  try:
+                      url = f"https://drive.google.com/uc?id={file_id}"
+
+                      # Use gdown with quiet mode and confirmation bypass
+                      cmd = [
+                          sys.executable, "-m", "gdown",
+                          "--fuzzy", url,
+                          "-O", output_path,
+                          "-q"
+                      ]
+
+                      result = subprocess.run(
+                          cmd,
+                          capture_output=True,
+                          text=True,
+                          timeout=300  # 5 minute timeout per file
+                      )
+
+                      if result.returncode == 0 and Path(output_path).exists():
+                          size = Path(output_path).stat().st_size
+                          print(f"  ✓ Downloaded: {file_name} ({size / 1024 / 1024:.2f} MB)")
+                          return True
+                      else:
+                          print(f"  ✗ Failed (attempt {attempt + 1}): {file_name}")
+                          if result.stderr:
+                              print(f"    Error: {result.stderr[:200]}")
+
+                  except subprocess.TimeoutExpired:
+                      print(f"  ⏱ Timeout (attempt {attempt + 1}): {file_name}")
+                  except Exception as e:
+                      print(f"  ✗ Error (attempt {attempt + 1}): {file_name} - {e}")
+
+                  # Exponential backoff
+                  if attempt < max_retries - 1:
+                      wait_time = 10 * (2 ** attempt)
+                      print(f"    Waiting {wait_time}s before retry...")
+                      time.sleep(wait_time)
+
+              return False
+
+          def main():
+              # Load configuration
+              batch_size = int(os.environ.get('BATCH_SIZE', 25))
+              delay_between_batches = int(os.environ.get('DELAY_BETWEEN_BATCHES', 30))
+              delay_between_files = int(os.environ.get('DELAY_BETWEEN_FILES', 2))
+
+              print("=" * 60)
+              print("Download Configuration:")
+              print(f"  Batch size: {batch_size}")
+              print(f"  Delay between batches: {delay_between_batches}s")
+              print(f"  Delay between files: {delay_between_files}s")
+              print("=" * 60)
+
+              # Load file list
+              try:
+                  with open('file_list/all_files.json', 'r') as f:
+                      all_files = json.load(f)
+              except Exception as e:
+                  print(f"Error loading file list: {e}")
+                  return
+
+              if not all_files:
+                  print("No files to download!")
+                  return
+
+              print(f"\nTotal files to process: {len(all_files)}")
+
+              # Check for already downloaded files
+              downloaded_files = set()
+              for root, dirs, files in os.walk('downloads'):
+                  for f in files:
+                      if f not in ['README.md', '.gitkeep']:
+                          downloaded_files.add(f)
+
+              print(f"Already downloaded: {len(downloaded_files)} files")
+
+              # Filter out already downloaded files
+              files_to_download = [
+                  f for f in all_files
+                  if f['name'] not in downloaded_files
+              ]
+
+              print(f"Files to download: {len(files_to_download)}")
+
+              if not files_to_download:
+                  print("All files already downloaded!")
+                  return
+
+              # Process files in batches
+              total_batches = (len(files_to_download) + batch_size - 1) // batch_size
+              successful = 0
+              failed = 0
+              failed_files = []
+
+              for batch_num in range(total_batches):
+                  start_idx = batch_num * batch_size
+                  end_idx = min(start_idx + batch_size, len(files_to_download))
+                  batch = files_to_download[start_idx:end_idx]
+
+                  print(f"\n{'=' * 60}")
+                  print(f"BATCH {batch_num + 1}/{total_batches}")
+                  print(f"Processing files {start_idx + 1} to {end_idx}")
+                  print(f"{'=' * 60}")
+
+                  for i, file_info in enumerate(batch):
+                      file_id = file_info['id']
+                      file_name = file_info['name']
+                      file_path = file_info.get('path', file_name)
+
+                      # Construct output path
+                      output_path = os.path.join('downloads', file_path)
+
+                      print(f"\n[{start_idx + i + 1}/{len(files_to_download)}] {file_name}")
+
+                      if download_file_with_retry(file_id, file_name, output_path):
+                          successful += 1
+                      else:
+                          failed += 1
+                          failed_files.append(file_info)
+
+                      # Delay between files
+                      if i < len(batch) - 1:
+                          time.sleep(delay_between_files)
+
+                  # Delay between batches (except for last batch)
+                  if batch_num < total_batches - 1:
+                      print(f"\n⏳ Batch complete. Waiting {delay_between_batches}s before next batch...")
+                      time.sleep(delay_between_batches)
+
+              # Summary
+              print("\n" + "=" * 60)
+              print("DOWNLOAD SUMMARY")
+              print("=" * 60)
+              print(f"Successful: {successful}")
+              print(f"Failed: {failed}")
+              print(f"Total processed: {successful + failed}")
+
+              # Save failed files for potential retry
+              if failed_files:
+                  with open('file_list/failed_files.json', 'w') as f:
+                      json.dump(failed_files, f, indent=2)
+                  print(f"\nFailed files saved to file_list/failed_files.json")
+                  print("Re-run the workflow to retry failed downloads.")
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
+
+          python download_files.py
+
+      - name: Generate README.md for each folder
+        run: |
+          find downloads -mindepth 1 -type d | while read -r folder; do
+            folder_name=$(basename "$folder")
+            readme_path="$folder/README.md"
+
+            echo "Creating README.md for: $folder_name"
+
+            echo "# $folder_name" > "$readme_path"
+            echo "" >> "$readme_path"
+            echo "## Files" >> "$readme_path"
+            echo "" >> "$readme_path"
+            echo "| File | Download |" >> "$readme_path"
+            echo "|------|----------|" >> "$readme_path"
+
+            find "$folder" -maxdepth 1 -type f ! -name "README.md" | sort | while read -r file; do
+              filename=$(basename "$file")
+              echo "| $filename | [Download]($filename) |" >> "$readme_path"
+            done
+
+            echo "" >> "$readme_path"
+            echo "---" >> "$readme_path"
+            echo "_Auto-generated by GitHub Actions_" >> "$readme_path"
+          done
+
+          echo "README.md files created for all folders"
+
+      - name: Display download summary
+        run: |
+          echo "=== Download Summary ==="
+          echo "Total size:"
+          du -sh downloads/ 2>/dev/null || echo "No files downloaded yet"
+          echo ""
+          echo "Folder structure:"
+          find downloads -type d 2>/dev/null | head -20 || echo "No folders yet"
+          echo ""
+          echo "Total files downloaded:"
+          find downloads -type f ! -name "README.md" 2>/dev/null | wc -l
+          echo ""
+
+          if [ -f file_list/failed_files.json ]; then
+            echo "=== Failed Downloads ==="
+            FAILED_COUNT=$(cat file_list/failed_files.json | python -c "import sys, json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+            echo "Failed files: $FAILED_COUNT"
+            echo "Re-run this workflow to retry failed downloads."
+          fi
+
+      - name: Commit and push files to repository
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add --force downloads/
+
+          if git diff --staged --quiet; then
+            echo "No new files to commit"
+          else
+            FILE_COUNT=$(find downloads -type f ! -name "README.md" | wc -l)
+            FOLDER_COUNT=$(find downloads -mindepth 1 -type d | wc -l)
+
+            git commit -m "📥 Downloaded $FILE_COUNT files in $FOLDER_COUNT folders from Google Drive"
+            git push
+
+            echo ""
+            echo "=============================================="
+            echo "Successfully committed $FILE_COUNT files!"
+            echo "=============================================="
+          fi
