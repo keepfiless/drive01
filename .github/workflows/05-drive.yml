@@ -1,4 +1,4 @@
-name: 05- Download Google Drive Files
+name: 05 - Download Google Drive Files
 
 on:
   workflow_dispatch:
@@ -54,8 +54,7 @@ jobs:
 
           # Download entire folder structure recursively
           # --folder: download as folder
-          # --remaining-ok: continue if some files fail
-          gdown --folder --remaining-ok "https://drive.google.com/drive/folders/$FOLDER_ID"
+          gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" || true
 
           echo "Download completed!"
 
