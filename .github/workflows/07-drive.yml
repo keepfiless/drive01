@@ -60,10 +60,10 @@ jobs:
           echo ""
 
           cd downloads
-          # gdown will skip existing files.
+          # Using --remaining ensures gdown only downloads files that do not already exist.
           # We use `|| true` so the workflow doesn't fail if gdown can't download all files due to rate limiting.
           # The next run of the workflow will pick up where this one left off.
-          gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" || true
+          gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" --remaining || true
           cd ..
 
           echo ""
