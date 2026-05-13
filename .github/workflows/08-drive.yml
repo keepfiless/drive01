@@ -60,16 +60,28 @@ jobs:
 
           cd downloads
 
+          CURRENT_FOLDER="root"
+
           # Run gdown and capture output in real-time
-          # Parse "Processing file" lines and save links to list.txt
+          # Parse folder and file lines, save links with folder name to list.txt
           gdown --folder "$FOLDER_URL" 2>&1 | while IFS= read -r line; do
             echo "$line"
 
+            # Detect folder change (gdown shows "Retrieving folder" or folder path)
+            if [[ "$line" =~ Retrieving\ folder\ list\ from\ (.+)$ ]]; then
+              CURRENT_FOLDER="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^Processing\ folder\ (.+)$ ]]; then
+              CURRENT_FOLDER="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^\[folder:\ (.+)\]$ ]]; then
+              CURRENT_FOLDER="${BASH_REMATCH[1]}"
+            fi
+
             if [[ "$line" =~ Processing\ file\ ([a-zA-Z0-9_-]+)\ (.+)$ ]]; then
               FILE_ID="${BASH_REMATCH[1]}"
+              FILE_NAME="${BASH_REMATCH[2]}"
               DOWNLOAD_LINK="https://drive.google.com/uc?id=${FILE_ID}&export=download"
 
-              echo "${DOWNLOAD_LINK}" >> ../list.txt
+              echo "${CURRENT_FOLDER} --- ${DOWNLOAD_LINK}" >> ../list.txt
             fi
           done
 
