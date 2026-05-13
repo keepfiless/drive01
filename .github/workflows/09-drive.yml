@@ -1,4 +1,4 @@
-name: 09 - Download Google Drive Files
+name: 08 - Download Google Drive Files
 
 on:
   workflow_dispatch:
@@ -65,40 +65,46 @@ jobs:
 
           cd ..
 
-          # Parse gdown output to extract folder context and file IDs
-          # gdown output format:
-          # "Retrieving folder list" (root folder)
-          # "Retrieving folder list from <FolderName>..." (entering subfolder)
-          # "Processing file <ID> <filename>" (file found)
+          # Create a temp file to track used file IDs (for handling duplicate filenames)
+          > /tmp/used_ids.txt
 
-          CURRENT_FOLDER="root"
+          # Walk through all downloaded files and get parent folder from actual path
+          find downloads -type f ! -name "gdown_output.log" ! -name "README.md" | while IFS= read -r filepath; do
+            # Get the parent folder name from actual file path
+            PARENT_FOLDER=$(basename "$(dirname "$filepath")")
 
-          while IFS= read -r line; do
-            # Detect entering a new folder (handles "Retrieving folder list from FolderName...")
-            if [[ "$line" =~ Retrieving\ folder\ list\ from\ (.+)\.\.\.$ ]]; then
-              CURRENT_FOLDER="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ Retrieving\ folder\ list\ from\ (.+)$ ]]; then
-              CURRENT_FOLDER="${BASH_REMATCH[1]}"
-              # Remove trailing dots if present
-              CURRENT_FOLDER="${CURRENT_FOLDER%...}"
-              CURRENT_FOLDER="${CURRENT_FOLDER%.}"
-            elif [[ "$line" =~ ^Retrieving\ folder\ list$ ]]; then
-              # Root folder - keep as root or use folder ID
-              CURRENT_FOLDER="root"
+            # If parent is "downloads", use "root"
+            if [[ "$PARENT_FOLDER" == "downloads" ]]; then
+              PARENT_FOLDER="root"
             fi
 
-            # Detect file processing
-            if [[ "$line" =~ Processing\ file\ ([a-zA-Z0-9_-]+)\ (.+)$ ]]; then
-              FILE_ID="${BASH_REMATCH[1]}"
-              FILE_NAME="${BASH_REMATCH[2]}"
-              DOWNLOAD_LINK="https://drive.google.com/uc?id=${FILE_ID}&export=download"
+            FILENAME=$(basename "$filepath")
 
-              echo "${CURRENT_FOLDER} --- ${DOWNLOAD_LINK}" >> list.txt
-            fi
-          done < downloads/gdown_output.log
+            # Find file ID from gdown output, excluding already used IDs
+            # Escape special regex characters in filename
+            ESCAPED_FILENAME=$(printf '%s\n' "$FILENAME" | sed 's/[[\.*^$()+?{|]/\\&/g')
 
-          # Clean up temp log
+            # Get all matching file IDs for this filename
+            while IFS= read -r match_line; do
+              if [[ "$match_line" =~ Processing\ file\ ([a-zA-Z0-9_-]+) ]]; then
+                FILE_ID="${BASH_REMATCH[1]}"
+
+                # Check if this ID was already used
+                if ! grep -q "^${FILE_ID}$" /tmp/used_ids.txt 2>/dev/null; then
+                  # Mark as used
+                  echo "$FILE_ID" >> /tmp/used_ids.txt
+
+                  DOWNLOAD_LINK="https://drive.google.com/uc?id=${FILE_ID}&export=download"
+                  echo "${PARENT_FOLDER} --- ${DOWNLOAD_LINK}" >> list.txt
+                  break
+                fi
+              fi
+            done < <(grep "Processing file.*${ESCAPED_FILENAME}$" downloads/gdown_output.log)
+          done
+
+          # Clean up temp files
           rm -f downloads/gdown_output.log
+          rm -f /tmp/used_ids.txt
 
           FILE_COUNT=$(wc -l < list.txt)
           echo ""
