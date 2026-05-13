@@ -1,4 +1,4 @@
-name: 09 - Download Google Drive Files
+name: 10 - Download Google Drive Files
 
 on:
   workflow_dispatch:
@@ -9,9 +9,9 @@ on:
         type: string
 
 jobs:
-  save-list:
+  download:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository
@@ -25,8 +25,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests beautifulsoup4
+      - name: Install gdown
+        run: pip install gdown
 
       - name: Extract folder ID from URL
         id: extract_id
@@ -42,268 +42,96 @@ jobs:
           echo "folder_id=$FOLDER_ID" >> $GITHUB_OUTPUT
           echo "Extracted folder ID: $FOLDER_ID"
 
-      - name: Scan Google Drive folder and save links to list.txt (NO DOWNLOAD)
+      - name: Create downloads directory
+        run: mkdir -p downloads
+
+      - name: Download files from Google Drive and save links to list.txt
         env:
           FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
         run: |
           echo "=============================================="
-          echo "Scanning Google Drive folder: $FOLDER_ID"
+          echo "Downloading from Google Drive folder: $FOLDER_ID"
           echo "=============================================="
 
-          python3 << 'EOF'
-          import requests
+          FOLDER_URL="https://drive.google.com/drive/folders/$FOLDER_ID"
+
+          # Initialize empty list.txt
+          > list.txt
+
+          cd downloads
+
+          # Run gdown and capture full output first
+          gdown --folder "$FOLDER_URL" 2>&1 | tee gdown_output.log
+
+          cd ..
+
+          # Create a Python script to properly extract ALL file IDs from gdown output
+          cat > extract_links.py << 'PYTHON_SCRIPT'
           import re
           import os
 
-          def get_folder_contents(folder_id, folder_name="root"):
-              """Get list of files and subfolders from a Google Drive folder WITHOUT downloading."""
-              results = []
+          # Read the gdown output log
+          log_path = "downloads/gdown_output.log"
+          if not os.path.exists(log_path):
+              print("No gdown output log found")
+              exit(1)
 
-              url = f"https://drive.google.com/drive/folders/{folder_id}"
-              headers = {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-              }
+          with open(log_path, "r") as f:
+              log_content = f.read()
 
-              try:
-                  response = requests.get(url, headers=headers)
-                  content = response.text
+          # Extract all file IDs and filenames from gdown output
+          # gdown outputs: "Processing file <FILE_ID> <FILENAME>" for each file
+          # This pattern captures ALL occurrences across all folders/subfolders
+          file_pattern = re.compile(r'Processing file ([a-zA-Z0-9_-]+) (.+?)(?:\n|$)')
+          file_matches = file_pattern.findall(log_content)
 
-                  # Find all file entries - pattern: ["FILE_ID","FILE_NAME"
-                  # Google Drive embeds file data in JavaScript
-                  file_pattern = r'\["([a-zA-Z0-9_-]{20,})","([^"]+)"'
-                  matches = re.findall(file_pattern, content)
+          # Build a dictionary of filename -> file_id (handle duplicates by keeping all)
+          file_id_map = {}
+          for file_id, filename in file_matches:
+              filename = filename.strip()
+              if filename not in file_id_map:
+                  file_id_map[filename] = []
+              file_id_map[filename].append(file_id)
 
-                  seen_ids = set()
-                  for file_id, file_name in matches:
-                      if file_id not in seen_ids and len(file_id) > 25:
-                          seen_ids.add(file_id)
-                          # Check if it's a folder or file by trying to detect folder pattern
-                          if not file_name.startswith("http") and "." in file_name:
-                              download_link = f"https://drive.google.com/uc?id={file_id}&export=download"
-                              results.append((folder_name, file_id, file_name, download_link))
+          # Now walk the downloads directory and match files to their IDs
+          results = []
+          used_ids = set()
 
-                  # Also try to find subfolders and recurse
-                  folder_pattern = r'data-id="([a-zA-Z0-9_-]{20,})"[^>]*>([^<]+)</div'
-
-              except Exception as e:
-                  print(f"Error scanning folder {folder_id}: {e}")
-
-              return results
-
-          def scan_with_gdown_api(folder_id):
-              """Use gdown's internal API to list files without downloading."""
-              import json
-
-              results = []
-              folders_to_scan = [(folder_id, "root")]
-
-              while folders_to_scan:
-                  current_folder_id, current_folder_name = folders_to_scan.pop(0)
-
-                  # Use Google Drive's folder listing API
-                  url = "https://drive.google.com/drive/folders/" + current_folder_id
-
-                  try:
-                      headers = {"User-Agent": "Mozilla/5.0"}
-                      resp = requests.get(url, headers=headers)
-
-                      # Extract file IDs and names from the page
-                      # Pattern for files: data-id="FILE_ID"
-                      id_pattern = r'data-id="([a-zA-Z0-9_-]{25,})"'
-                      ids = re.findall(id_pattern, resp.text)
-
-                      # Pattern for names after data-id
-                      for fid in set(ids):
-                          if fid != current_folder_id:
-                              # Try to determine if folder or file
-                              check_url = f"https://drive.google.com/file/d/{fid}/view"
-                              check_resp = requests.head(check_url, headers=headers, allow_redirects=True)
-
-                              if "folder" in check_resp.url:
-                                  # It's a subfolder - get its name and add to scan queue
-                                  name_match = re.search(rf'{fid}[^>]*>([^<]+)<', resp.text)
-                                  subfolder_name = name_match.group(1) if name_match else fid
-                                  folders_to_scan.append((fid, subfolder_name))
-                              else:
-                                  # It's a file
-                                  download_link = f"https://drive.google.com/uc?id={fid}&export=download"
-                                  results.append((current_folder_name, download_link))
-
-                  except Exception as e:
-                      print(f"Error: {e}")
+          for root, dirs, files in os.walk("downloads"):
+              for filename in files:
+                  if filename in ["gdown_output.log", "README.md"]:
                       continue
 
-              return results
+                  filepath = os.path.join(root, filename)
+                  parent_folder = os.path.basename(root)
 
-          def simple_scan(folder_id):
-              """Simple scan using direct API approach."""
-              import urllib.request
-              import json
+                  if filename in file_id_map:
+                      # Get an unused file ID for this filename
+                      for fid in file_id_map[filename]:
+                          if fid not in used_ids:
+                              used_ids.add(fid)
+                              download_link = f"https://drive.google.com/uc?id={fid}&export=download"
+                              results.append(f"{parent_folder} --- {download_link}")
+                              break
 
-              results = []
-              folders_to_process = [(folder_id, "root")]
-              processed_folders = set()
+          # Write results to list.txt
+          with open("list.txt", "w") as f:
+              for line in results:
+                  f.write(line + "\n")
 
-              while folders_to_process:
-                  fid, fname = folders_to_process.pop(0)
-                  if fid in processed_folders:
-                      continue
-                  processed_folders.add(fid)
+          print(f"Extracted {len(results)} file links to list.txt")
+          PYTHON_SCRIPT
 
-                  print(f"Scanning folder: {fname} ({fid})")
+          python extract_links.py
+          rm -f extract_links.py
 
-                  # Use the embeddedfolderview endpoint
-                  url = f"https://drive.google.com/embeddedfolderview?id={fid}"
-                  headers = {"User-Agent": "Mozilla/5.0"}
+          # Clean up temp log
+          rm -f downloads/gdown_output.log
 
-                  try:
-                      req = urllib.request.Request(url, headers=headers)
-                      with urllib.request.urlopen(req, timeout=30) as response:
-                          content = response.read().decode('utf-8', errors='ignore')
-
-                      # Find flip entries which contain file/folder info
-                      # Pattern: ["ITEM_ID","ITEM_NAME","..."]
-                      pattern = r'\["(1[a-zA-Z0-9_-]{30,})","([^"]*)"'
-                      matches = re.findall(pattern, content)
-
-                      seen = set()
-                      for item_id, item_name in matches:
-                          if item_id in seen or not item_name:
-                              continue
-                          seen.add(item_id)
-
-                          # Determine if file or folder by checking if name has extension
-                          if '.' in item_name and len(item_name.split('.')[-1]) <= 5:
-                              # Likely a file
-                              download_link = f"https://drive.google.com/uc?id={item_id}&export=download"
-                              results.append((fname, download_link))
-                              print(f"  Found file: {item_name}")
-                          else:
-                              # Might be a folder - add to queue
-                              folders_to_process.append((item_id, item_name))
-                              print(f"  Found subfolder: {item_name}")
-
-                  except Exception as e:
-                      print(f"Error scanning {fname}: {e}")
-
-              return results
-
-          # Main execution
-          folder_id = os.environ.get('FOLDER_ID')
-          print(f"Starting scan of folder: {folder_id}")
-
-          results = simple_scan(folder_id)
-
-          # Write to list.txt
-          with open('list.txt', 'w') as f:
-              for folder_name, download_link in results:
-                  f.write(f"{folder_name} --- {download_link}\n")
-
-          print(f"\nTotal files found: {len(results)}")
-          EOF
-
-          FILE_COUNT=$(wc -l < list.txt 2>/dev/null || echo "0")
+          FILE_COUNT=$(wc -l < list.txt)
           echo ""
           echo "=============================================="
-          echo "Scan completed! Saved $FILE_COUNT links to list.txt"
-          echo "=============================================="
-
-      - name: Display list.txt content
-        run: |
-          echo "=== list.txt content ==="
-          cat list.txt
-
-      - name: Commit list.txt to repository
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-
-          git add --force list.txt
-
-          if git diff --staged --quiet; then
-            echo "No changes to list.txt"
-          else
-            git commit -m "📋 Generated list.txt with download links"
-            git push
-
-            echo ""
-            echo "=============================================="
-            echo "Successfully committed list.txt!"
-            echo "=============================================="
-          fi
-
-  get-files:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
-    needs: save-list
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-
-      - name: Pull latest changes
-        run: git pull origin main || git pull origin master || true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install gdown
-        run: pip install gdown
-
-      - name: Create downloads directory
-        run: mkdir -p downloads
-
-      - name: Download files from list.txt
-        run: |
-          echo "=============================================="
-          echo "Downloading files from list.txt"
-          echo "=============================================="
-
-          if [[ ! -f list.txt ]]; then
-            echo "Error: list.txt not found!"
-            exit 1
-          fi
-
-          while IFS= read -r line; do
-            # Parse: FOLDER_NAME --- URL
-            FOLDER_NAME=$(echo "$line" | sed 's/ --- .*//')
-            URL=$(echo "$line" | sed 's/.* --- //')
-
-            if [[ -z "$URL" || -z "$FOLDER_NAME" ]]; then
-              continue
-            fi
-
-            # Extract file ID from URL
-            FILE_ID=$(echo "$URL" | grep -oP 'id=\K[a-zA-Z0-9_-]+')
-
-            # Create folder if not exists
-            if [[ "$FOLDER_NAME" != "root" ]]; then
-              mkdir -p "downloads/$FOLDER_NAME"
-              DOWNLOAD_DIR="downloads/$FOLDER_NAME"
-            else
-              DOWNLOAD_DIR="downloads"
-            fi
-
-            echo "Downloading to $DOWNLOAD_DIR (File ID: $FILE_ID)"
-
-            # Download using gdown (handles Google Drive auth properly)
-            cd "$DOWNLOAD_DIR"
-            gdown --fuzzy "$URL" || \
-              gdown "https://drive.google.com/uc?id=${FILE_ID}" || \
-              wget --content-disposition "$URL" -q || \
-              echo "Warning: Failed to download $FILE_ID"
-            cd - > /dev/null
-
-          done < list.txt
-
-          echo ""
-          echo "=============================================="
-          echo "Download completed!"
+          echo "Download completed! Saved $FILE_COUNT links to list.txt"
           echo "=============================================="
 
       - name: Generate README.md for each folder
@@ -353,7 +181,7 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          git add --force downloads/
+          git add --force downloads/ list.txt
 
           if git diff --staged --quiet; then
             echo "No new files to commit"
@@ -367,5 +195,6 @@ jobs:
             echo ""
             echo "=============================================="
             echo "Successfully committed $FILE_COUNT files!"
+            echo "list.txt saved with all download links"
             echo "=============================================="
           fi
