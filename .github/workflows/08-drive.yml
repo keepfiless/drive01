@@ -55,43 +55,31 @@ jobs:
 
           FOLDER_URL="https://drive.google.com/drive/folders/$FOLDER_ID"
 
-          # Initialize list.txt
-          echo "# Google Drive Download Links" > list.txt
-          echo "# Generated from folder: $FOLDER_URL" >> list.txt
-          echo "# Format: FILE_ID | FILENAME | DOWNLOAD_LINK" >> list.txt
-          echo "# ============================================" >> list.txt
-          echo "" >> list.txt
+          # Initialize empty list.txt
+          > list.txt
 
           cd downloads
 
           # Run gdown and capture output in real-time
-          # Parse "Processing file" lines and save to list.txt
+          # Parse "Processing file" lines and save links to list.txt
           gdown --folder "$FOLDER_URL" 2>&1 | while IFS= read -r line; do
             echo "$line"
 
             if [[ "$line" =~ Processing\ file\ ([a-zA-Z0-9_-]+)\ (.+)$ ]]; then
               FILE_ID="${BASH_REMATCH[1]}"
-              FILE_NAME="${BASH_REMATCH[2]}"
               DOWNLOAD_LINK="https://drive.google.com/uc?id=${FILE_ID}&export=download"
 
-              echo "${FILE_ID} | ${FILE_NAME} | ${DOWNLOAD_LINK}" >> ../list.txt
+              echo "${DOWNLOAD_LINK}" >> ../list.txt
             fi
           done
 
           cd ..
 
-          # Add total count
-          FILE_COUNT=$(grep -c "drive.google.com" list.txt || echo "0")
-          echo "" >> list.txt
-          echo "# Total files: $FILE_COUNT" >> list.txt
-
+          FILE_COUNT=$(wc -l < list.txt)
           echo ""
           echo "=============================================="
-          echo "Download completed! Found $FILE_COUNT files"
+          echo "Download completed! Saved $FILE_COUNT links to list.txt"
           echo "=============================================="
-          echo ""
-          echo "=== list.txt content ==="
-          cat list.txt
 
       - name: Generate README.md for each folder
         run: |
