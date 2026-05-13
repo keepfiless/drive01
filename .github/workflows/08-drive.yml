@@ -60,32 +60,30 @@ jobs:
 
           cd downloads
 
-          CURRENT_FOLDER="root"
+          # Run gdown and capture full output first
+          gdown --folder "$FOLDER_URL" 2>&1 | tee gdown_output.log
 
-          # Run gdown and capture output in real-time
-          # Parse folder and file lines, save links with folder name to list.txt
-          gdown --folder "$FOLDER_URL" 2>&1 | while IFS= read -r line; do
-            echo "$line"
+          cd ..
 
-            # Detect folder change (gdown shows "Retrieving folder" or folder path)
-            if [[ "$line" =~ Retrieving\ folder\ list\ from\ (.+)$ ]]; then
-              CURRENT_FOLDER="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^Processing\ folder\ (.+)$ ]]; then
-              CURRENT_FOLDER="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^\[folder:\ (.+)\]$ ]]; then
-              CURRENT_FOLDER="${BASH_REMATCH[1]}"
-            fi
+          # Now parse the downloaded files by walking the directory structure
+          # Each file's parent folder name will be used as the prefix
+          find downloads -type f ! -name "gdown_output.log" ! -name "README.md" | while IFS= read -r filepath; do
+            # Get the parent folder name (immediate parent directory)
+            PARENT_FOLDER=$(basename "$(dirname "$filepath")")
+            FILENAME=$(basename "$filepath")
 
-            if [[ "$line" =~ Processing\ file\ ([a-zA-Z0-9_-]+)\ (.+)$ ]]; then
-              FILE_ID="${BASH_REMATCH[1]}"
-              FILE_NAME="${BASH_REMATCH[2]}"
+            # Extract file ID from gdown output log using the filename
+            # gdown output format: "Processing file <ID> <filename>"
+            FILE_ID=$(grep -E "Processing file [a-zA-Z0-9_-]+ ${FILENAME}$" downloads/gdown_output.log | head -1 | sed -E 's/.*Processing file ([a-zA-Z0-9_-]+) .*/\1/')
+
+            if [[ -n "$FILE_ID" ]]; then
               DOWNLOAD_LINK="https://drive.google.com/uc?id=${FILE_ID}&export=download"
-
-              echo "${CURRENT_FOLDER} --- ${DOWNLOAD_LINK}" >> ../list.txt
+              echo "${PARENT_FOLDER} --- ${DOWNLOAD_LINK}" >> list.txt
             fi
           done
 
-          cd ..
+          # Clean up temp log
+          rm -f downloads/gdown_output.log
 
           FILE_COUNT=$(wc -l < list.txt)
           echo ""
