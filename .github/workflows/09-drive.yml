@@ -9,9 +9,9 @@ on:
         type: string
 
 jobs:
-  download:
+  save-list:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -45,12 +45,12 @@ jobs:
       - name: Create downloads directory
         run: mkdir -p downloads
 
-      - name: Download files from Google Drive and save links to list.txt
+      - name: Scan Google Drive folder and save links to list.txt
         env:
           FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
         run: |
           echo "=============================================="
-          echo "Downloading from Google Drive folder: $FOLDER_ID"
+          echo "Scanning Google Drive folder: $FOLDER_ID"
           echo "=============================================="
 
           FOLDER_URL="https://drive.google.com/drive/folders/$FOLDER_ID"
@@ -109,7 +109,93 @@ jobs:
           FILE_COUNT=$(wc -l < list.txt)
           echo ""
           echo "=============================================="
-          echo "Download completed! Saved $FILE_COUNT links to list.txt"
+          echo "Scan completed! Saved $FILE_COUNT links to list.txt"
+          echo "=============================================="
+
+      - name: Display list.txt content
+        run: |
+          echo "=== list.txt content ==="
+          cat list.txt
+
+      - name: Commit list.txt to repository
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add --force list.txt
+
+          if git diff --staged --quiet; then
+            echo "No changes to list.txt"
+          else
+            git commit -m "📋 Generated list.txt with download links"
+            git push
+
+            echo ""
+            echo "=============================================="
+            echo "Successfully committed list.txt!"
+            echo "=============================================="
+          fi
+
+  get-files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    needs: save-list
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull origin main || git pull origin master || true
+
+      - name: Create downloads directory
+        run: mkdir -p downloads
+
+      - name: Download files from list.txt
+        run: |
+          echo "=============================================="
+          echo "Downloading files from list.txt"
+          echo "=============================================="
+
+          if [[ ! -f list.txt ]]; then
+            echo "Error: list.txt not found!"
+            exit 1
+          fi
+
+          while IFS= read -r line; do
+            # Parse: FOLDER_NAME --- URL
+            FOLDER_NAME=$(echo "$line" | sed 's/ --- .*//')
+            URL=$(echo "$line" | sed 's/.* --- //')
+
+            if [[ -z "$URL" || -z "$FOLDER_NAME" ]]; then
+              continue
+            fi
+
+            # Create folder if not exists
+            if [[ "$FOLDER_NAME" != "root" ]]; then
+              mkdir -p "downloads/$FOLDER_NAME"
+              DOWNLOAD_DIR="downloads/$FOLDER_NAME"
+            else
+              DOWNLOAD_DIR="downloads"
+            fi
+
+            echo "Downloading to $DOWNLOAD_DIR from: $URL"
+
+            # Download using wget with Google Drive handling
+            cd "$DOWNLOAD_DIR"
+            wget --content-disposition "$URL" -q --show-progress || \
+              curl -L -J -O "$URL" || \
+              echo "Warning: Failed to download $URL"
+            cd - > /dev/null
+
+          done < list.txt
+
+          echo ""
+          echo "=============================================="
+          echo "Download completed!"
           echo "=============================================="
 
       - name: Generate README.md for each folder
@@ -159,7 +245,7 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          git add --force downloads/ list.txt
+          git add --force downloads/
 
           if git diff --staged --quiet; then
             echo "No new files to commit"
@@ -173,6 +259,5 @@ jobs:
             echo ""
             echo "=============================================="
             echo "Successfully committed $FILE_COUNT files!"
-            echo "list.txt saved with all download links"
             echo "=============================================="
           fi
