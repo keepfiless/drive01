@@ -1,0 +1,299 @@
+name: 08 - Download Google Drive Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_folder_url:
+        description: 'Google Drive folder URL (public shared link)'
+        required: true
+        type: string
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install gdown
+        run: pip install gdown
+
+      - name: Extract folder ID from URL
+        id: extract_id
+        run: |
+          URL="${{ github.event.inputs.drive_folder_url }}"
+          if [[ "$URL" =~ folders/([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          elif [[ "$URL" =~ id=([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          else
+            FOLDER_ID="$URL"
+          fi
+          echo "folder_id=$FOLDER_ID" >> $GITHUB_OUTPUT
+          echo "Extracted folder ID: $FOLDER_ID"
+
+      - name: Create downloads directory
+        run: mkdir -p downloads
+
+      - name: Get file list from Google Drive and save to list.txt
+        env:
+          FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
+        run: |
+          echo "=============================================="
+          echo "Getting file list from Google Drive folder: $FOLDER_ID"
+          echo "=============================================="
+
+          # Create Python script to list files
+          cat > get_file_list.py << 'PYTHON_SCRIPT'
+          import sys
+          import gdown
+          from gdown.download_folder import _parse_google_drive_file
+          import requests
+          import re
+
+          def get_folder_contents(folder_id):
+              """Get list of files in a Google Drive folder"""
+              url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+              try:
+                  session = requests.Session()
+                  res = session.get(url)
+
+                  if res.status_code != 200:
+                      print(f"Error: Could not access folder (status {res.status_code})", file=sys.stderr)
+                      return []
+
+                  # Parse the page content to extract file information
+                  # Look for file IDs and names in the page
+                  content = res.text
+
+                  # Pattern to match file entries in Google Drive folder page
+                  # This extracts file IDs and names from the page source
+                  files = []
+
+                  # Try to find file data in the page
+                  # Google Drive embeds file info in specific patterns
+
+                  # Pattern 1: Look for file IDs with names
+                  pattern = r'\["([a-zA-Z0-9_-]{25,})","([^"]+)"'
+                  matches = re.findall(pattern, content)
+
+                  seen_ids = set()
+                  for file_id, name in matches:
+                      if file_id not in seen_ids and len(file_id) > 20:
+                          # Filter out non-file IDs
+                          if not name.startswith('http') and '/' not in name:
+                              files.append((file_id, name))
+                              seen_ids.add(file_id)
+
+                  return files
+
+              except Exception as e:
+                  print(f"Error getting folder contents: {e}", file=sys.stderr)
+                  return []
+
+          def main():
+              if len(sys.argv) < 2:
+                  print("Usage: python get_file_list.py <folder_id>", file=sys.stderr)
+                  sys.exit(1)
+
+              folder_id = sys.argv[1]
+
+              # Use gdown's built-in folder listing
+              try:
+                  from gdown.download_folder import _get_folder_list
+
+                  # Get folder contents using gdown's internal function
+                  url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+                  # Alternative: use gdown with --dry-run like behavior
+                  import subprocess
+                  result = subprocess.run(
+                      ['gdown', '--folder', url, '--dry-run'],
+                      capture_output=True,
+                      text=True
+                  )
+
+                  output = result.stdout + result.stderr
+
+                  # Parse the output for file information
+                  files = []
+                  for line in output.split('\n'):
+                      if 'Processing file' in line:
+                          parts = line.split('Processing file')
+                          if len(parts) > 1:
+                              file_info = parts[1].strip().split(' ', 1)
+                              if len(file_info) >= 2:
+                                  file_id = file_info[0]
+                                  file_name = file_info[1]
+                                  files.append((file_id, file_name))
+                      elif line.startswith('Retrieving') or line.startswith('Processing'):
+                          continue
+
+                  # Output the file list
+                  for file_id, file_name in files:
+                      download_link = f"https://drive.google.com/uc?id={file_id}&export=download"
+                      print(f"{file_id}|{file_name}|{download_link}")
+
+              except Exception as e:
+                  print(f"Error: {e}", file=sys.stderr)
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
+
+          # Run gdown with dry-run first to get file list
+          echo "Scanning Google Drive folder..."
+
+          FOLDER_URL="https://drive.google.com/drive/folders/$FOLDER_ID"
+
+          # Capture gdown output to parse file information
+          gdown --folder "$FOLDER_URL" --dry-run 2>&1 | tee gdown_output.txt || true
+
+          # Parse the output and create list.txt
+          echo "# Google Drive Download Links" > list.txt
+          echo "# Generated from folder: $FOLDER_URL" >> list.txt
+          echo "# Format: FILE_ID | FILENAME | DOWNLOAD_LINK" >> list.txt
+          echo "# ============================================" >> list.txt
+          echo "" >> list.txt
+
+          FILE_COUNT=0
+
+          while IFS= read -r line; do
+            if [[ "$line" =~ Processing\ file\ ([a-zA-Z0-9_-]+)\ (.+)$ ]]; then
+              FILE_ID="${BASH_REMATCH[1]}"
+              FILE_NAME="${BASH_REMATCH[2]}"
+              DOWNLOAD_LINK="https://drive.google.com/uc?id=${FILE_ID}&export=download"
+
+              echo "${FILE_ID} | ${FILE_NAME} | ${DOWNLOAD_LINK}" >> list.txt
+              echo "Found: $FILE_NAME"
+
+              FILE_COUNT=$((FILE_COUNT + 1))
+            fi
+          done < gdown_output.txt
+
+          echo "" >> list.txt
+          echo "# Total files: $FILE_COUNT" >> list.txt
+
+          echo ""
+          echo "=============================================="
+          echo "Found $FILE_COUNT files in Google Drive folder"
+          echo "=============================================="
+
+          # Clean up
+          rm -f gdown_output.txt get_file_list.py
+
+          # Show list.txt content
+          echo ""
+          echo "=== list.txt content ==="
+          cat list.txt
+
+      - name: Commit list.txt to repository
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add list.txt
+
+          if git diff --staged --quiet; then
+            echo "No changes to list.txt"
+          else
+            git commit -m "📋 Added file list from Google Drive"
+            git push
+            echo "✅ list.txt committed and pushed to repository"
+          fi
+
+      - name: Download files from Google Drive
+        env:
+          FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
+        run: |
+          echo "=============================================="
+          echo "Starting download from Google Drive folder: $FOLDER_ID"
+          echo "=============================================="
+          echo ""
+          echo "NOTE: Google Drive may rate limit after ~50-100 files."
+          echo "If that happens, run this workflow again to resume."
+          echo "Already downloaded files will be skipped."
+          echo ""
+
+          cd downloads
+          gdown --folder "https://drive.google.com/drive/folders/$FOLDER_ID" || true
+          cd ..
+
+          echo ""
+          echo "Download attempt completed!"
+
+      - name: Generate README.md for each folder
+        run: |
+          find downloads -mindepth 1 -type d | while read -r folder; do
+            folder_name=$(basename "$folder")
+            readme_path="$folder/README.md"
+
+            echo "Creating README.md for: $folder_name"
+
+            echo "# $folder_name" > "$readme_path"
+            echo "" >> "$readme_path"
+            echo "## Files" >> "$readme_path"
+            echo "" >> "$readme_path"
+            echo "| File | Download |" >> "$readme_path"
+            echo "|------|----------|" >> "$readme_path"
+
+            find "$folder" -maxdepth 1 -type f ! -name "README.md" | sort -V | while read -r file; do
+              filename=$(basename "$file")
+              echo "| $filename | [Download]($filename) |" >> "$readme_path"
+            done
+
+            echo "" >> "$readme_path"
+            echo "---" >> "$readme_path"
+            echo "_Auto-generated by GitHub Actions_" >> "$readme_path"
+          done
+
+          echo "README.md files created for all folders"
+
+      - name: Display download summary
+        run: |
+          echo "=== Download Summary ==="
+          echo "Total size:"
+          du -sh downloads/ 2>/dev/null || echo "No files downloaded yet"
+          echo ""
+          echo "Folder structure:"
+          find downloads -type d 2>/dev/null || echo "No folders yet"
+          echo ""
+          echo "Total files downloaded:"
+          find downloads -type f 2>/dev/null | wc -l
+          echo ""
+          echo "If not all files were downloaded (rate limited),"
+          echo "run this workflow again to continue downloading."
+
+      - name: Commit and push files to repository
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add --force downloads/
+
+          if git diff --staged --quiet; then
+            echo "No new files to commit"
+          else
+            FILE_COUNT=$(find downloads -type f ! -name "README.md" | wc -l)
+            FOLDER_COUNT=$(find downloads -mindepth 1 -type d | wc -l)
+
+            git commit -m "📥 Downloaded $FILE_COUNT files in $FOLDER_COUNT folders from Google Drive"
+            git push
+
+            echo ""
+            echo "=============================================="
+            echo "Successfully committed $FILE_COUNT files!"
+            echo "=============================================="
+          fi
