@@ -1,0 +1,204 @@
+name: 🧹 پاکسازی تاریخچه
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'فقط بررسی (بدون تغییر)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      size_threshold_mb:
+        description: 'حداکثر سایز (MB)'
+        required: true
+        default: '20'
+        type: string
+
+jobs:
+  analyze:
+    name: 🔍 بررسی
+    runs-on: ubuntu-latest
+    outputs:
+      has_deleted_blobs: ${{ steps.analyze.outputs.found }}
+    steps:
+      - name: 📥 دریافت مخزن
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📊 سایز فعلی
+        run: |
+          echo "## 📊 سایز فعلی مخزن" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          git gc --quiet
+          size=$(du -sh .git | cut -f1)
+          echo "**سایز .git:** $size" >> $GITHUB_STEP_SUMMARY
+          echo "Current .git size: $size"
+
+      - name: 🔎 یافتن فایل‌های حذف شده در تاریخچه
+        id: analyze
+        run: |
+          SIZE_MB=${{ inputs.size_threshold_mb }}
+          SIZE_BYTES=$((SIZE_MB * 1024 * 1024))
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔎 فایل‌های حذف شده بزرگتر از ${SIZE_MB}MB" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get list of files currently in HEAD
+          git ls-tree -r HEAD --name-only > current_files.txt
+
+          # Find large blobs and filter only DELETED ones
+          > deleted_large_files.txt
+
+          git rev-list --objects --all | \
+            git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' | \
+            awk -v threshold="$SIZE_BYTES" '$1 == "blob" && $3 >= threshold {print $3, $4}' | \
+            sort -rn | while read size path; do
+              if [ -n "$path" ]; then
+                # Check if file exists in current HEAD
+                if ! grep -qx "$path" current_files.txt; then
+                  # File is DELETED - add to list
+                  echo "$path" >> deleted_large_files.txt
+                  size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+                  echo "Found deleted: $path (${size_mb}MB)"
+                fi
+              fi
+            done
+
+          # Remove duplicates
+          sort -u deleted_large_files.txt > temp.txt && mv temp.txt deleted_large_files.txt
+
+          if [ -s deleted_large_files.txt ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+
+            echo "| سایز (MB) | مسیر |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
+
+            while read path; do
+              # Get size of this blob
+              size=$(git rev-list --objects --all | \
+                git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' | \
+                grep " $path$" | awk '{print $3}' | head -1)
+              size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+              echo "| ${size_mb} | \`${path}\` |" >> $GITHUB_STEP_SUMMARY
+            done < deleted_large_files.txt
+
+            COUNT=$(wc -l < deleted_large_files.txt)
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**تعداد:** $COUNT فایل حذف شده" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ این فایل‌ها از repo حذف شده‌اند ولی در history فضا اشغال می‌کنند" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "✨ فایل حذف شده بزرگی یافت نشد!" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: 📤 ذخیره لیست
+        if: steps.analyze.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deleted-files-list
+          path: deleted_large_files.txt
+          retention-days: 1
+
+  clean:
+    name: 🗑️ پاکسازی
+    needs: analyze
+    if: needs.analyze.outputs.has_deleted_blobs == 'true' && inputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 دریافت مخزن
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 دریافت لیست
+        uses: actions/download-artifact@v4
+        with:
+          name: deleted-files-list
+
+      - name: ⚙️ نصب ابزار
+        run: pip install git-filter-repo
+
+      - name: 💾 پشتیبان‌گیری
+        run: |
+          BACKUP_BRANCH="backup-$(date +%Y%m%d-%H%M%S)"
+          git branch $BACKUP_BRANCH HEAD
+          echo "✅ Backup: $BACKUP_BRANCH"
+
+      - name: 📊 سایز قبل
+        run: |
+          git gc --quiet
+          SIZE_BEFORE=$(du -sb .git | cut -f1)
+          echo "SIZE_BEFORE=$SIZE_BEFORE" >> $GITHUB_ENV
+          echo "Size before: $(du -sh .git | cut -f1)"
+
+      - name: 🧹 حذف فایل‌های حذف شده از تاریخچه
+        run: |
+          echo "🧹 Removing deleted files from history..."
+          echo "⚠️ Current repo files will NOT be touched!"
+          echo ""
+
+          # Remove only the deleted files from history
+          git filter-repo --invert-paths --paths-from-file deleted_large_files.txt --force
+
+          echo ""
+          echo "✅ Done!"
+
+      - name: 📊 سایز بعد
+        run: |
+          git gc --aggressive --prune=now
+          SIZE_AFTER=$(du -sb .git | cut -f1)
+          SIZE_BEFORE=${{ env.SIZE_BEFORE }}
+
+          SAVED=$((SIZE_BEFORE - SIZE_AFTER))
+          SAVED_MB=$(echo "scale=2; $SAVED / 1024 / 1024" | bc)
+
+          echo "## 📊 نتیجه پاکسازی" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| قبل | بعد | صرفه‌جویی |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-----|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| $(echo "scale=2; $SIZE_BEFORE/1024/1024" | bc)MB | $(echo "scale=2; $SIZE_AFTER/1024/1024" | bc)MB | ${SAVED_MB}MB |" >> $GITHUB_STEP_SUMMARY
+
+      - name: 🚀 ارسال تغییرات
+        run: |
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          git push origin --force --all
+          git push origin --force --tags
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **تاریخچه پاکسازی شد!**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ همکاران باید مجدد clone کنند" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    name: 📋 خلاصه
+    needs: [analyze, clean]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📝 گزارش نهایی
+        run: |
+          echo "## 📋 خلاصه" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "🔍 **حالت:** فقط بررسی" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "برای پاکسازی، dry_run را false کنید." >> $GITHUB_STEP_SUMMARY
+          else
+            if [ "${{ needs.analyze.outputs.has_deleted_blobs }}" == "true" ]; then
+              echo "🧹 **پاکسازی انجام شد**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ فایل‌های فعلی repo دست نخورده باقی ماندند" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✨ نیازی به پاکسازی نبود" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
