@@ -34,7 +34,6 @@ jobs:
         run: |
           echo "## 📊 سایز فعلی مخزن" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          git gc --quiet
           size=$(du -sh .git | cut -f1)
           echo "**سایز .git:** $size" >> $GITHUB_STEP_SUMMARY
           echo "Current .git size: $size"
@@ -134,7 +133,6 @@ jobs:
 
       - name: 📊 سایز قبل
         run: |
-          git gc --quiet
           SIZE_BEFORE=$(du -sb .git | cut -f1)
           echo "SIZE_BEFORE=$SIZE_BEFORE" >> $GITHUB_ENV
           echo "Size before: $(du -sh .git | cut -f1)"
@@ -153,7 +151,6 @@ jobs:
 
       - name: 📊 سایز بعد
         run: |
-          git gc --aggressive --prune=now
           SIZE_AFTER=$(du -sb .git | cut -f1)
           SIZE_BEFORE=${{ env.SIZE_BEFORE }}
 
@@ -165,13 +162,34 @@ jobs:
           echo "| قبل | بعد | صرفه‌جویی |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|-----|-----------|" >> $GITHUB_STEP_SUMMARY
           echo "| $(echo "scale=2; $SIZE_BEFORE/1024/1024" | bc)MB | $(echo "scale=2; $SIZE_AFTER/1024/1024" | bc)MB | ${SAVED_MB}MB |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⏳ سایز نهایی در Settings → General قابل مشاهده است" >> $GITHUB_STEP_SUMMARY
 
       - name: 🚀 ارسال تغییرات
         run: |
+          # Increase buffer for large repos
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
-          git push origin --force --all
-          git push origin --force --tags
+          # Push each branch separately with retry
+          for branch in $(git branch -a --format='%(refname:short)' | grep -v 'origin/'); do
+            echo "Pushing branch: $branch"
+            for i in 1 2 3; do
+              if git push origin "$branch" --force; then
+                echo "✅ $branch pushed"
+                break
+              else
+                echo "⚠️ Retry $i for $branch..."
+                sleep 5
+              fi
+            done
+          done
+
+          # Push tags
+          git push origin --force --tags || true
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "✅ **تاریخچه پاکسازی شد!**" >> $GITHUB_STEP_SUMMARY
